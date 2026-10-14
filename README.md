@@ -1,0 +1,211 @@
+# @signupbouncer/better-auth
+
+A [Better Auth](https://better-auth.com) plugin that checks each new sign-up with
+[signupbouncer](https://signupbouncer.com) and refuses the ones signupbouncer says to block, such as sign-ups from
+throwaway email addresses. If signupbouncer is slow or down, the sign-up goes through. By default your users wait at
+most 1.5 seconds on the check.
+
+You need a signupbouncer API key. Create an account at https://signupbouncer.com/signup and copy the key (`sb_live_...`)
+from your dashboard. The full API docs are at https://signupbouncer.com/docs.
+
+## Install
+
+Deno:
+
+```sh
+deno add jsr:@signupbouncer/better-auth
+```
+
+Node, Bun and other npm-based setups, from npm:
+
+```sh
+npm install @signupbouncer/better-auth
+```
+
+or from JSR:
+
+```sh
+npx jsr add @signupbouncer/better-auth
+```
+
+The plugin has no dependencies of its own. It needs `better-auth` 1.7 or later, which your app already has, as a peer
+dependency.
+
+## Use
+
+```ts
+import { betterAuth } from "better-auth";
+import { signupBouncer } from "@signupbouncer/better-auth";
+
+export const auth = betterAuth({
+  emailAndPassword: { enabled: true },
+  plugins: [
+    signupBouncer({
+      apiKey: process.env.SIGNUPBOUNCER_API_KEY!, // sb_live_..., from your signupbouncer dashboard
+      // ipHeader: "cf-connecting-ip", // the header your host sets to the client IP. See "The client IP".
+    }),
+  ],
+});
+```
+
+New signupbouncer apps start in **shadow mode**. Every sign-up is checked and logged in your dashboard, and none is
+blocked. When the log looks right, switch the app to enforce in the dashboard. The plugin needs no change for that,
+because it acts on the `action` field of the answer. In shadow mode `action` is always `"allow"`.
+
+A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "<blockMessage>" }`. On the client,
+`authClient.signUp.email()` returns it as `error`, so show `error.message`.
+
+## What it does
+
+- Checks every `POST /sign-up/email` before Better Auth creates the user. It sends signupbouncer the email, the
+  User-Agent and, when you configure a source for it, the client IP.
+- Refuses the sign-up when the answer's `action` is `"block"`. A `"challenge"` answer is allowed unless you set
+  `challenge: "block"`, because Better Auth has no captcha step to send it to.
+- With `checkOtherSignups: true`, also checks users created by OAuth, magic link, email OTP and other plugins (see
+  below).
+
+It leaves alone sign-ins, password resets, sessions and anything else that does not create a user. It stores nothing and
+keeps no state between requests.
+
+## When a check fails, the sign-up goes through
+
+Any failure allows the sign-up. That covers a timeout, a network error, a non-2xx answer (such as 401 for a wrong key)
+and an answer that is not a complete `/v1/check` response. Only a complete answer can refuse a sign-up.
+
+Each failure calls `onError` with one of these reasons:
+
+- `timeout`: no full answer within `timeoutMs`.
+- `network`: a DNS, TLS or connection failure.
+- `http_status`: any non-2xx answer (401 bad key, 404 unknown app, 5xx). `status` holds the code.
+- `bad_response`: the body was not JSON, was missing a field the API always sends or had one of the wrong type, or the
+  connection broke while it was being read.
+- `missing_api_key`: `apiKey` was empty. No request was made.
+- `malformed_api_key`: `apiKey` holds a space, newline or other character a key never has. No request was made.
+
+Without `onError`, the plugin writes one `console.warn` line per failure, for example:
+
+```
+[signupbouncer] check failed (http_status 401), sign-up allowed. Check the signupbouncer API key in your config.
+```
+
+The line and the `onError` argument hold only the reason and the status code. They never hold the API key, the email,
+the IP, an exception message or response text, so you can log them whole. Pass your own `onError` to send failures to
+your logger, or `onError: () => {}` to turn the warning off. The plugin does not wait for `onError`, so a slow logger
+never delays a sign-up, and anything it throws is ignored.
+
+## Options
+
+| Option              | Default                                          | Meaning                                                                                     |
+| ------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `apiKey`            | required                                         | Your `sb_live_...` key. If it is empty, every sign-up is allowed and `onError` is called.   |
+| `baseUrl`           | `https://signupbouncer.com`                      | API origin.                                                                                 |
+| `app`               | your first app                                   | Which signupbouncer app (`app_...`) to log the checks under.                                |
+| `timeoutMs`         | `1500`                                           | How long to wait before allowing the sign-up anyway. At most 10,000.                        |
+| `blockMessage`      | "Please sign up with a permanent email address." | Message returned to the client on a block.                                                  |
+| `challenge`         | `"allow"`                                        | What to do when the answer is `"challenge"`: `"allow"` or `"block"`.                        |
+| `ipHeader`          | none (email-only checks)                         | The one header your host overwrites with the client IP. See "The client IP".                |
+| `trustedProxies`    | `1`                                              | For X-Forwarded-For on a fixed proxy chain only: the entry this many places from the right. |
+| `getIp`             | none                                             | `(request, headers) => ip`: your own IP lookup, used instead of `ipHeader`.                 |
+| `onError`           | one `console.warn` line                          | Called with `{ reason, status? }` when a check fails. The sign-up is still allowed.         |
+| `checkOtherSignups` | `false`                                          | Also check users created by OAuth, magic link, email OTP and other plugins (see below).     |
+
+### The client IP
+
+By default the plugin reads no request header and sends no IP, so signupbouncer checks the email alone. A client can
+send `CF-Connecting-IP`, `X-Real-IP` or `X-Forwarded-For` itself. Unless something in front of your app overwrites that
+header, a bot can pick any IP it likes, get past the IP checks, or get a stranger's address blocked.
+
+Set `ipHeader` to the one header your host writes itself:
+
+| Where your app runs             | Setting                                                                      |
+| ------------------------------- | ---------------------------------------------------------------------------- |
+| Behind Cloudflare (proxied DNS) | `ipHeader: "cf-connecting-ip"`, and only accept traffic from Cloudflare      |
+| Vercel                          | `ipHeader: "x-real-ip"`, or `"x-vercel-forwarded-for"` with a proxy in front |
+| Fly.io                          | `ipHeader: "fly-client-ip"`                                                  |
+| Node behind your own proxies    | Best: `ipHeader: "x-real-ip"`, written by your edge proxy (see below)        |
+| Anything else                   | `getIp: (request, headers) => ...` with your platform's own lookup           |
+
+- **Cloudflare** sends `CF-Connecting-IP`, the address of the client connecting to Cloudflare, on traffic from its edge
+  to your origin (https://developers.cloudflare.com/fundamentals/reference/http-headers/#cf-connecting-ip). That holds
+  only while every request comes through Cloudflare. If your origin is reachable directly, a client can send the header
+  itself.
+- **Vercel** overwrites `X-Forwarded-For` and does not forward external IPs, to prevent spoofing. `X-Real-IP` and
+  `X-Vercel-Forwarded-For` carry the same value, and `X-Vercel-Forwarded-For` keeps the client IP even when you put your
+  own proxy in front of Vercel (https://vercel.com/docs/headers/request-headers#x-forwarded-for,
+  https://vercel.com/docs/headers/request-headers#x-vercel-forwarded-for).
+- **Fly.io**'s proxy sets `Fly-Client-IP` to "the IP address of the client from the perspective of Fly Proxy"
+  (https://docs.fly.io/networking/request-headers). Fly's page does not say whether it replaces a value the client sent.
+  With another proxy in front of Fly, the header holds that proxy's address.
+
+Your own proxies (self-hosted nginx, Caddy, HAProxy, a cloud load balancer), safest first:
+
+1. **One header, written by the proxy that faces the internet.** Have that proxy overwrite a header of its own with the
+   address it received the connection from, and have any proxies behind it pass that header through unchanged. For nginx
+   at the edge: `proxy_set_header X-Real-IP $remote_addr;`, then `ipHeader: "x-real-ip"`. This holds even if a client
+   sends `X-Real-IP` itself, because the edge proxy replaces it. It works only when the app cannot be reached without
+   passing through that proxy.
+2. **A resolver that knows your proxies' addresses.** If requests can reach you along different paths, let the proxy in
+   front of the app work out the client address from its list of trusted proxy addresses (nginx `ngx_http_realip_module`
+   with `set_real_ip_from <your proxy CIDRs>` and `real_ip_recursive on`, then pass `$remote_addr` on as `X-Real-IP`).
+   It looks at the address that actually connected, which a count of hops cannot do.
+3. **A hop count on `X-Forwarded-For`, only on a fixed path.** A proxy that appends to `X-Forwarded-For` (nginx
+   `proxy_add_x_forwarded_for`, most load balancers) keeps whatever the client sent and adds the address it saw at the
+   right. Set `ipHeader: "x-forwarded-for"` and `trustedProxies` to the number of proxies in the chain. The plugin takes
+   the entry that many places from the right (default 1, the right-most). This is safe only when **every** request
+   passes through the same chain of exactly that many proxies, and the inner proxies and the app are unreachable except
+   through it (a private network, or firewall rules that accept only the previous hop). If an inner proxy can be reached
+   directly, a client sends `X-Forwarded-For: <any IP>`, the proxy appends the real address, and the list has the length
+   you configured, so the plugin uses the client's made-up entry. A list shorter than the count gives no IP, but that
+   does not prove the request came through the whole chain.
+
+Better Auth's own rate limiter reads the client IP too and has its own setting for it
+(https://better-auth.com/docs/concepts/rate-limit#connecting-ip-address). This plugin does not read that setting.
+
+### Sign-ups other than email and password
+
+By default the plugin checks `POST /sign-up/email` only, through a `hooks.before` entry. With `checkOtherSignups: true`
+it also adds a `user.create.before` database hook, so it checks every user created through a request: OAuth callbacks,
+ID-token sign-in, One Tap, magic link, email OTP and so on.
+
+- OAuth and other provider callbacks (paths containing `/callback`, `/sign-in/social`, `/one-tap/`) send the email with
+  `auth_provider`, the provider id from the path such as `"google"`, plus the IP when you configured one. signupbouncer
+  scores these on the IP and signup bursts only, because the provider has verified the email, and still counts the
+  email's domain in your dashboard.
+- Magic link, email OTP and the rest send the email and the IP.
+- The hook skips `/sign-up/email` (the before hook already checked it), `/admin/*` (users your admins create),
+  `/sign-in/anonymous`, and users your own server code creates without a request.
+
+A block in a database hook throws the same `APIError`. For redirect flows such as OAuth and magic link, Better Auth
+sends the user to your error callback URL instead of returning JSON. We have tested that path with magic link. On other
+redirect flows the error the user sees depends on the flow and your Better Auth version.
+
+### Using the check directly
+
+`checkSignup(options, { email, ip, userAgent })` is exported too. It returns `{ ok, action, response | error }` and
+never throws, so you can run the same fail-open check from any route. `shouldBlock(result, challenge)` turns the result
+into a yes or no.
+
+## Better Auth APIs this plugin uses
+
+Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.7 from npm:
+
+- Plugin `hooks.before` entries with `matcher` and `createAuthMiddleware` from `better-auth/api`:
+  https://better-auth.com/docs/concepts/plugins#hooks
+- Throwing `APIError` from a hook to stop the request: https://better-auth.com/docs/concepts/hooks#errors
+- `databaseHooks.user.create.before`, and throwing `APIError` from it:
+  https://better-auth.com/docs/concepts/database#database-hooks. A plugin supplies database hooks by returning
+  `{ options: { databaseHooks } }` from its `init` function. The `BetterAuthPlugin` type includes that, and the built-in
+  admin plugin uses it, but the plugin docs page does not describe it.
+
+## Development
+
+```sh
+deno task test           # unit tests, plus a real in-memory Better Auth instance with the signupbouncer API mocked
+deno task check          # fmt, lint, type check
+deno task publish:check  # deno publish --dry-run
+deno task build:npm      # builds the npm package into npm/ (see scripts/build_npm.ts)
+```
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

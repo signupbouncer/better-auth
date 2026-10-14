@@ -1,0 +1,46 @@
+# Checks every push and pull request: format, lint, type check, tests, a JSR publish dry run, the npm build, and an
+# import of the built npm package in Node.
+#
+# Actions are pinned to full commit SHAs (resolved with `git ls-remote` and checked with the GitHub API on
+# 14 Oct 2026). The comment after each SHA is the release tag it points at.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      - run: deno install --frozen
+      - run: deno task check
+      - run: deno task test
+      - run: deno task publish:check
+      - run: deno task build:npm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      # better-auth comes from npm/node_modules, which the build filled with `deno install` (no install scripts).
+      - name: Import the npm build in Node
+        working-directory: npm
+        run: |
+          node --input-type=module -e '
+            const m = await import("./esm/mod.js");
+            const p = m.signupBouncer({ apiKey: "sb_live_ci" });
+            if (p.id !== "signupbouncer" || typeof p.hooks.before[0].handler !== "function") process.exit(1);
+            console.log("exports:", Object.keys(m).sort().join(" "));
+          '
+      - name: List what npm would publish
+        working-directory: npm
+        run: npm pack --dry-run --ignore-scripts

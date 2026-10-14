@@ -1,0 +1,23 @@
+{
+  "name": "@signupbouncer/better-auth",
+  "version": "0.1.0",
+  "license": "MIT",
+  "exports": "./mod.ts",
+  "imports": {
+    "better-auth": "npm:better-auth@^1.7.0",
+    "better-auth/api": "npm:better-auth@^1.7.0/api",
+    "@std/assert": "jsr:@std/assert@^1.0.19",
+    "@deno/dnt": "jsr:@deno/dnt@0.44.0"
+  },
+  "publish": {
+    "include": ["mod.ts", "README.md", "LICENSE"]
+  },
+  "fmt": { "lineWidth": 120, "exclude": ["npm/", ".dnt/"] },
+  "lint": { "rules": { "tags": ["recommended", "jsr"] }, "exclude": ["npm/", ".dnt/"] },
+  "tasks": {
+    "test": "deno test --allow-env=NODE_ENV,NODE_DISABLE_COLORS,TERM,TMUX,TF_BUILD,CI,TEAMCITY_VERSION,TERM_PROGRAM,COLORTERM,TEST,BETTER_AUTH_SECRETS,BETTER_AUTH_TELEMETRY_DEBUG,BETTER_AUTH_TELEMETRY_ENDPOINT,BETTER_AUTH_TRUSTED_ORIGINS --allow-read=README.md test/",
+    "check": "deno fmt --check && deno lint && deno check mod.ts test/ scripts/",
+    "publish:check": "deno publish --dry-run",
+    "build:npm": "deno run --no-prompt --allow-read=.,$HOME/.cache/deno,$HOME/.npmrc --allow-write=npm,.dnt --allow-env=DENO_DIR,HOME,XDG_CACHE_HOME --allow-run=deno scripts/build_npm.ts"
+  }
+}
