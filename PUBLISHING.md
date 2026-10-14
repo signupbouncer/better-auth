@@ -11,10 +11,10 @@ such as `v0.1.0` runs `.github/workflows/publish.yml`, which publishes to JSR (G
 
    ```
    git remote add origin git@github.com:signupbouncer/better-auth.git
-   git push -u origin main
+   git push -u origin master
    ```
 
-   Wait for the `ci` workflow to go green on `main` before going further.
+   Wait for the `ci` workflow to go green on `master` before going further.
 
 2. **JSR scope and package.** Sign in at https://jsr.io with the GitHub account that owns the `signupbouncer` org.
    - Create the scope `@signupbouncer` and, in it, the package `better-auth` (https://jsr.io/new).
