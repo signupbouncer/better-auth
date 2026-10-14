@@ -4,15 +4,18 @@
 import { assert, assertEquals } from "@std/assert";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
-import { magicLink } from "better-auth/plugins";
-import { type CheckError, checkSignup, providerFromPath, signupBouncer, type SignupBouncerOptions } from "../mod.ts";
+import { genericOAuth, magicLink } from "better-auth/plugins";
+import { createAuthMiddleware } from "better-auth/api";
+import { type CheckError, checkSignup, signupBouncer, type SignupBouncerOptions } from "../mod.ts";
+import { providerFor } from "../internal.ts";
 import { answer, type Call, hang, json, mockFetch } from "./mock_fetch.ts";
 
 const BASE = "http://localhost:3000";
 
-function makeAuth(opts: Partial<SignupBouncerOptions> = {}) {
+function makeAuth(opts: Partial<SignupBouncerOptions> = {}, extra: Parameters<typeof betterAuth>[0] = {}) {
   const db = { user: [], session: [], account: [], verification: [] } as Record<string, Record<string, unknown>[]>;
   const auth = betterAuth({
+    ...extra,
     baseURL: BASE,
     secret: "test-secret-test-secret-test-secret-0123",
     database: memoryAdapter(db),
@@ -230,7 +233,7 @@ Deno.test("checkOtherSignups: a real magic-link sign-up is checked and blocked; 
   }
 });
 
-Deno.test("checkOtherSignups: database hook blocks a non-email-signup path; OAuth sends the provider", async () => {
+Deno.test("database hook: blocks other paths; verified OAuth sends the provider from ctx.params", async () => {
   const plugin = signupBouncer({
     apiKey: "sb_live_test",
     baseUrl: "https://sb.test",
@@ -240,8 +243,8 @@ Deno.test("checkOtherSignups: database hook blocks a non-email-signup path; OAut
   // deno-lint-ignore no-explicit-any
   const init = await (plugin.init as any)({});
   const before = init.options.databaseHooks.user.create.before as (
-    user: { email: string },
-    ctx?: { path?: string; headers?: Headers },
+    user: { email: string; emailVerified?: boolean },
+    ctx?: { path?: string; params?: Record<string, string>; headers?: Headers },
   ) => Promise<unknown>;
   const m = mockApi(() => answer("block"));
   try {
@@ -255,41 +258,56 @@ Deno.test("checkOtherSignups: database hook blocks a non-email-signup path; OAut
     assert(threw, "magic-link signup should be blocked");
     assertEquals(m.calls[0].body, { email: "x@mailinator.com", ip: "203.0.113.50" });
 
+    // Better Auth passes the route pattern as path and the provider in params (P2-5).
     threw = false;
     try {
-      await before({ email: "x@gmail.com" }, { path: "/callback/google", headers });
+      await before(
+        { email: "x@gmail.com", emailVerified: true },
+        { path: "/callback/:id", params: { id: "google" }, headers },
+      );
     } catch {
       threw = true;
     }
     assert(threw, "oauth signup from a blocked IP should be blocked");
-    // The provider-verified email goes with its provider, so the API scores IP only but keeps the domain.
     assertEquals(m.calls[1].body, { email: "x@gmail.com", ip: "203.0.113.50", auth_provider: "google" });
 
-    // Skipped: no endpoint context (server code), the email sign-up path, admin-created users.
-    await before({ email: "x@mailinator.com" });
-    await before({ email: "x@mailinator.com" }, { path: "/sign-up/email", headers });
-    await before({ email: "x@mailinator.com" }, { path: "/admin/create-user", headers });
-    assertEquals(m.calls.length, 2);
+    // An unverified OAuth email is checked as an email, with no auth_provider (P1-2).
+    await before({ email: "y@mailinator.com", emailVerified: false }, {
+      path: "/callback/:id",
+      params: { id: "acme" },
+      headers,
+    }).catch(() => {});
+    assertEquals(m.calls[2].body, { email: "y@mailinator.com", ip: "203.0.113.50" });
 
-    // Without an IP source an OAuth sign-up is still sent (email + provider), so an OAuth-only app's sign-ups count.
+    // Skipped: no endpoint context (server code), admin-created users, anonymous users.
+    await before({ email: "x@mailinator.com" });
+    await before({ email: "x@mailinator.com" }, { path: "/admin/create-user", headers });
+    await before({ email: "x@mailinator.com" }, { path: "/sign-in/anonymous", headers });
+    assertEquals(m.calls.length, 3);
+
+    // Without an IP source a verified OAuth sign-up is still sent (email + provider).
     const noIp = signupBouncer({ apiKey: "sb_live_test", baseUrl: "https://sb.test", checkOtherSignups: true });
     // deno-lint-ignore no-explicit-any
     const noIpBefore = (await (noIp.init as any)({})).options.databaseHooks.user.create.before;
-    await noIpBefore({ email: "x@gmail.com" }, { path: "/callback/github", headers }).catch(() => {});
-    assertEquals(m.calls[2].body, { email: "x@gmail.com", auth_provider: "github" });
+    await noIpBefore({ email: "x@gmail.com", emailVerified: true }, {
+      path: "/callback/:id",
+      params: { id: "github" },
+      headers,
+    }).catch(() => {});
+    assertEquals(m.calls[3].body, { email: "x@gmail.com", auth_provider: "github" });
   } finally {
     m.restore();
   }
 });
 
-Deno.test("providerFromPath: callback ids, One Tap, ID-token sign-in, fallback", () => {
-  assertEquals(providerFromPath("/callback/google"), "google");
-  assertEquals(providerFromPath("/oauth2/callback/acme-oidc"), "acme-oidc");
-  assertEquals(providerFromPath("/sso/callback/okta"), "okta");
-  assertEquals(providerFromPath("/one-tap/callback"), "google");
-  assertEquals(providerFromPath("/sign-in/social", { provider: "apple" }), "apple");
-  assertEquals(providerFromPath("/sign-in/social", { provider: "<script>" }), "oauth");
-  assertEquals(providerFromPath("/callback"), "oauth");
+Deno.test("providerFor: params id or providerId, One Tap, ID-token sign-in, fallback", () => {
+  assertEquals(providerFor({ path: "/callback/:id", params: { id: "google" } }), "google");
+  assertEquals(providerFor({ path: "/sso/callback/:providerId", params: { providerId: "okta" } }), "okta");
+  assertEquals(providerFor({ path: "/one-tap/callback" }), "google");
+  assertEquals(providerFor({ path: "/sign-in/social", body: { provider: "apple" } }), "apple");
+  assertEquals(providerFor({ path: "/sign-in/social", body: { provider: "<script>" } }), "oauth");
+  assertEquals(providerFor({ path: "/callback/:id", params: { id: ":id" } }), "oauth");
+  assertEquals(providerFor({ path: "/callback/:id" }), "oauth");
 });
 
 Deno.test("checkSignup sends auth_provider only when given", async () => {
@@ -334,6 +352,122 @@ Deno.test("#3 a real sign-up survives an async onError that rejects", async () =
     assertEquals((await signUp(auth, "logger-down@example.com")).status, 200);
     assertEquals(db.user.length, 1);
     await new Promise((r) => setTimeout(r, 20)); // an unhandled rejection would fail this test
+  } finally {
+    m.restore();
+  }
+});
+
+// ---- Astra review fixes (P1-1, P1-2, P1-3, P2-5) --------------------------------------------------------------------
+
+Deno.test("email sign-up makes exactly one check, with and without checkOtherSignups", async () => {
+  for (const checkOtherSignups of [false, true]) {
+    const { auth, db } = makeAuth({ checkOtherSignups });
+    const m = mockApi(() => answer("allow"));
+    try {
+      assertEquals((await signUp(auth, "Once@Example.com")).status, 200);
+      assertEquals(m.calls.map((c) => c.body.email), ["Once@Example.com"]);
+      assertEquals(db.user.length, 1);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+Deno.test("P1-1 a 66k-character email is refused before any request and no user is saved", async () => {
+  const { auth, db } = makeAuth();
+  const m = mockApi(() => json({ error: "body_too_large" }, 413)); // what the real API answers to a 64 KiB+ body
+  try {
+    const email = "a".repeat(66_000) + "@mailinator.com";
+    const res = await signUp(auth, email);
+    assertEquals(res.status, 400);
+    assertEquals((await res.json()).code, "SIGNUP_BLOCKED");
+    assertEquals(m.calls.length, 0);
+    assertEquals(db.user.length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("P1-3 an app hook that rewrites the email cannot slip the rewritten address past the check", async () => {
+  for (const checkOtherSignups of [false, true]) {
+    const { auth, db } = makeAuth({ checkOtherSignups }, {
+      hooks: {
+        // deno-lint-ignore require-await
+        before: createAuthMiddleware(async (ctx) => {
+          if (ctx.path !== "/sign-up/email") return;
+          return { context: { body: { ...(ctx.body as object), email: "blocked@mailinator.com" } } };
+        }),
+      },
+    });
+    const m = mockApi((email) => answer(email.endsWith("@mailinator.com") ? "block" : "allow"));
+    try {
+      const res = await signUp(auth, "innocent@example.com");
+      assertEquals(res.status, 400, `checkOtherSignups: ${checkOtherSignups}`);
+      assertEquals((await res.json()).code, "SIGNUP_BLOCKED");
+      assertEquals(m.calls.map((c) => c.body.email), ["innocent@example.com", "blocked@mailinator.com"]);
+      assertEquals(db.user.length, 0);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+/** Runs a real generic-OAuth sign-up (sign-in/social, then /callback/acme) with the IdP replaced by functions. */
+async function oauthSignUp(emailVerified: boolean, email: string) {
+  const db = { user: [], session: [], account: [], verification: [] } as Record<string, Record<string, unknown>[]>;
+  const auth = betterAuth({
+    baseURL: BASE,
+    secret: "test-secret-test-secret-test-secret-0123",
+    database: memoryAdapter(db),
+    rateLimit: { enabled: false },
+    telemetry: { enabled: false },
+    plugins: [
+      genericOAuth({
+        config: [{
+          providerId: "acme",
+          clientId: "client",
+          clientSecret: "secret",
+          authorizationUrl: "https://idp.test/authorize",
+          getToken: () => Promise.resolve({ accessToken: "at", tokenType: "Bearer" }),
+          getUserInfo: () => Promise.resolve({ id: "idp-user-1", email, emailVerified, name: "Test" }),
+        }],
+      }),
+      signupBouncer({ apiKey: "sb_live_test", baseUrl: "https://sb.test", checkOtherSignups: true }),
+    ],
+  });
+  const start = await auth.handler(
+    new Request(`${BASE}/api/auth/sign-in/social`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: BASE },
+      body: JSON.stringify({ provider: "acme", callbackURL: `${BASE}/done`, errorCallbackURL: `${BASE}/error` }),
+    }),
+  );
+  assertEquals(start.status, 200);
+  const { url } = await start.json();
+  const state = new URL(url).searchParams.get("state");
+  assert(state, "authorization URL carries a state");
+  const cookie = start.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+  const callback = await auth.handler(
+    new Request(`${BASE}/api/auth/callback/acme?code=code-1&state=${encodeURIComponent(state)}`, {
+      headers: { cookie },
+    }),
+  );
+  await callback.body?.cancel();
+  return { db, location: callback.headers.get("location") ?? "" };
+}
+
+Deno.test("P1-2 + P2-5 real OAuth callback: verified email sends the real provider id, unverified is checked as email", async () => {
+  const m = mockApi((email) => answer(email.endsWith("@mailinator.com") ? "block" : "allow"));
+  try {
+    const verified = await oauthSignUp(true, "person@example.com");
+    assertEquals(m.calls.map((c) => c.body), [{ email: "person@example.com", auth_provider: "acme" }]);
+    assertEquals(verified.db.user.length, 1);
+    assert(verified.location.startsWith(`${BASE}/done`), verified.location);
+
+    const unverified = await oauthSignUp(false, "farm@mailinator.com");
+    assertEquals(m.calls[1].body, { email: "farm@mailinator.com" });
+    assertEquals(unverified.db.user.length, 0);
+    assert(unverified.location.startsWith(`${BASE}/error`), unverified.location);
   } finally {
     m.restore();
   }

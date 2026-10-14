@@ -13,17 +13,27 @@
  * });
  * ```
  *
- * Better Auth APIs used (checked 2026-10-14 against the docs and better-auth 1.7.7 on npm):
+ * Better Auth APIs used (checked 2026-10-14 against the docs and better-auth 1.7.0 and 1.7.7 from npm):
  * - plugin `hooks.before` with `matcher` + `createAuthMiddleware`: https://better-auth.com/docs/concepts/plugins#hooks
  * - throwing `APIError` from a hook: https://better-auth.com/docs/concepts/hooks#errors
  * - `databaseHooks.user.create.before` (returned from the plugin's `init`, as the built-in admin plugin does):
- *   https://better-auth.com/docs/concepts/database#database-hooks
+ *   https://better-auth.com/docs/concepts/database#database-hooks. Better Auth passes the endpoint context as the
+ *   second argument, with the route pattern in `path` (`/callback/:id`) and the values in `params`.
  *
  * @module
  */
 
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthMiddleware } from "better-auth/api";
+import {
+  clientIp,
+  type HookCtx,
+  isCheckableEmail,
+  isCompleteAnswer,
+  normalizeIp,
+  providerFor,
+  readCapped,
+} from "./internal.ts";
 
 /** What signupbouncer says to do with a sign-up. In shadow mode this is always `"allow"`. */
 export type SignupAction = "allow" | "challenge" | "block";
@@ -32,6 +42,7 @@ export type SignupAction = "allow" | "challenge" | "block";
 export type CheckErrorReason =
   | "missing_api_key"
   | "malformed_api_key"
+  | "no_input"
   | "timeout"
   | "network"
   | "http_status"
@@ -48,32 +59,45 @@ export interface CheckError {
   status?: number;
 }
 
-/** The parts of the `/v1/check` answer this plugin relies on. Other fields are passed through untouched. */
+/** A complete `/v1/check` answer. The plugin acts on one only when every field below is present and well-typed. */
 export interface CheckResponse {
   /** The verdict before the app's mode is applied. Never act on it: in shadow mode it can say block. */
-  verdict?: SignupAction;
+  verdict: SignupAction;
   /** What to do: the verdict in enforce mode, always `"allow"` in shadow mode. */
   action: SignupAction;
   /** The app's mode in your signupbouncer dashboard. */
-  mode?: "shadow" | "enforce";
+  mode: "shadow" | "enforce";
   /** Risk score; 70 and up blocks with the default thresholds. */
-  score?: number;
+  score: number;
   /** Id of this check in your dashboard log (`chk_...`). */
-  check_id?: string;
+  check_id: string;
   /** Why the score is what it is. */
-  reasons?: { code: string; detail?: string; points?: number; tier?: string }[];
+  reasons: { code: string; detail: string; points: number; tier: string }[];
   /** What a higher plan would also have flagged. */
-  shadow?: { code: string; tier?: string; detail?: string }[];
+  shadow: { code: string; detail: string; tier: string }[];
+  /** The mailbox provider, if known, and how often the same inbox signed up in the last 7 days. */
+  normalized: { provider: string | null; repeat_signups_7d: number };
+  /** The IP's network, or `null` when no usable IP was sent. */
+  network: { asn: number | null; asn_org: string | null; kinds: string[]; label: string | null; prefix: string } | null;
+  /** Time the check took on signupbouncer's side, in milliseconds. */
+  latency_ms: number;
   /** True when the check was skipped because the account is over its monthly limit. The action is then allow. */
-  quota_exceeded?: boolean;
-  /** Fields this plugin does not read (`normalized`, `network`, `latency_ms` and any added later). */
+  quota_exceeded: boolean;
+  /** Fields added to the API later. */
   [key: string]: unknown;
 }
 
-/** Result of one check. `action` is always set: `"allow"` whenever the check failed. */
+/**
+ * Result of one check. `action` is always set:
+ * - `ok: true`: signupbouncer answered, and `action` is its answer.
+ * - `ok: false` with `action: "allow"`: the check failed and the sign-up is allowed (fail open).
+ * - `ok: false` with `action: "block"`: the email is longer than 320 characters or is not an address. The API would cut
+ *   or reject it, so the plugin refuses it without a request.
+ */
 export type CheckResult =
   | { ok: true; action: SignupAction; response: CheckResponse }
-  | { ok: false; action: "allow"; error: CheckError };
+  | { ok: false; action: "allow"; error: CheckError }
+  | { ok: false; action: "block"; error: { reason: "invalid_email" } };
 
 /** Options for {@linkcode signupBouncer}. Only `apiKey` is required. */
 export interface SignupBouncerOptions {
@@ -120,9 +144,10 @@ export interface SignupBouncerOptions {
   onError?: (error: CheckError) => unknown;
   /**
    * Also check users created outside `/sign-up/email` (OAuth callbacks, magic link, email OTP and other plugins),
-   * through a `user.create.before` database hook. OAuth sign-ups send the email with `auth_provider` (the provider id,
-   * such as `"google"`): signupbouncer scores them on IP and signup bursts only, because the provider has verified the
-   * email, and counts the email's domain in your dashboard. Default `false`.
+   * through a `user.create.before` database hook. An OAuth sign-up whose provider marked the email verified is sent
+   * with `auth_provider` (the provider id, such as `"google"`): signupbouncer scores it on IP and signup bursts only and
+   * counts the email's domain in your dashboard. One with an unverified email is checked like an email sign-up.
+   * Default `false`.
    */
   checkOtherSignups?: boolean;
 }
@@ -136,41 +161,11 @@ export const MAX_TIMEOUT_MS = 10_000;
 /** The message a blocked sign-up gets when `blockMessage` is not set. */
 export const DEFAULT_BLOCK_MESSAGE = "Please sign up with a permanent email address.";
 
-const ACTIONS = new Set<string>(["allow", "challenge", "block"]);
-
-/** Returns `raw` as a bare IP address (ports and IPv6 brackets removed), or `undefined` if it does not look like one. */
-export function normalizeIp(raw: string | undefined | null): string | undefined {
-  let ip = raw?.trim() ?? "";
-  if (ip.startsWith("[")) ip = ip.slice(1, ip.indexOf("]") > 0 ? ip.indexOf("]") : undefined); // "[::1]:443"
-  else if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(ip)) ip = ip.slice(0, ip.lastIndexOf(":")); // "1.2.3.4:5678"
-  return ip.length > 0 && ip.length <= 64 && /^[0-9a-fA-F:.]+$/.test(ip) ? ip : undefined;
-}
-
-/**
- * Reads the client IP from `ipHeader`, the one header your host or proxy overwrites. Without `ipHeader` it returns
- * `undefined`: no header is trusted by default. For a comma-separated list the entry `trustedProxies` places from the
- * right is used (default 1, the right-most), because entries further left were sent by the client.
- */
-export function clientIp(
-  headers: Headers | undefined,
-  ipHeader: string | undefined,
-  trustedProxies = 1,
-): string | undefined {
-  if (!headers || !ipHeader) return undefined;
-  const raw = headers.get(ipHeader);
-  if (!raw) return undefined;
-  const entries = raw.split(",");
-  const n = Number.isInteger(trustedProxies) && trustedProxies >= 1 ? trustedProxies : 1;
-  // Fewer entries than trusted proxies: the chain did not come through all of them, so none of it can be trusted.
-  if (entries.length < n) return undefined;
-  return normalizeIp(entries[entries.length - n]);
-}
-
 /**
  * The `onError` used when you pass none: one `console.warn` line. It holds the fixed reason and the status code only,
  * never the API key, the email, the IP, an exception message or response text.
  */
-export function warnCheckError(error: CheckError): void {
+function warnCheckError(error: CheckError): void {
   const status = typeof error.status === "number" ? ` ${error.status}` : "";
   const hint = error.reason === "missing_api_key" || error.reason === "malformed_api_key" || error.status === 401
     ? " Check the signupbouncer API key in your config."
@@ -195,49 +190,22 @@ function report(onError: SignupBouncerOptions["onError"], error: CheckError): Ch
   return { ok: false, action: "allow", error };
 }
 
-const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
-const isStr = (v: unknown): v is string => typeof v === "string";
-const isStrOrNull = (v: unknown): boolean => v === null || typeof v === "string";
-
 /**
- * True only for a complete `/v1/check` answer: every field the API always sends, with the right type. Only such an
- * answer can refuse a sign-up; a partial or malformed one counts as a failed check (allow, `onError` "bad_response").
- * A refusing answer must also be consistent: enforce mode, under quota, and `action` equal to `verdict`.
- */
-export function isCheckResponse(v: unknown): v is CheckResponse {
-  if (!isObj(v)) return false;
-  const { action, verdict, mode, reasons, shadow, normalized: n, network: net } = v;
-  if (!isStr(action) || !ACTIONS.has(action) || !isStr(verdict) || !ACTIONS.has(verdict)) return false;
-  if (mode !== "shadow" && mode !== "enforce") return false;
-  if (!isNum(v.score) || !isStr(v.check_id) || !isNum(v.latency_ms) || typeof v.quota_exceeded !== "boolean") {
-    return false;
-  }
-  const reasonOk = (r: unknown) => isObj(r) && isStr(r.code) && isStr(r.detail) && isNum(r.points) && isStr(r.tier);
-  if (!Array.isArray(reasons) || !reasons.every(reasonOk)) return false;
-  const shadowOk = (r: unknown) => isObj(r) && isStr(r.code) && isStr(r.detail) && isStr(r.tier);
-  if (!Array.isArray(shadow) || !shadow.every(shadowOk)) return false;
-  if (!isObj(n) || !isStrOrNull(n.provider) || !isNum(n.repeat_signups_7d)) return false;
-  if (
-    net !== null &&
-    !(isObj(net) && (net.asn === null || isNum(net.asn)) && isStrOrNull(net.asn_org) && Array.isArray(net.kinds) &&
-      net.kinds.every(isStr) && isStrOrNull(net.label) && isStr(net.prefix))
-  ) return false;
-  return action === "allow" || (mode === "enforce" && v.quota_exceeded === false && action === verdict);
-}
-
-/**
- * Calls `POST {baseUrl}/v1/check`. Never throws: on any failure it returns `action: "allow"` and calls `onError`
- * (or {@linkcode warnCheckError} when there is none). Exported so you can run the same check from your own routes.
+ * Calls `POST {baseUrl}/v1/check`. Never throws. On any failure it returns `action: "allow"` and calls `onError` (or
+ * writes one `console.warn` line when there is none). An email longer than 320 characters, or one that is not an
+ * address, returns `action: "block"` without a request. Exported so you can run the same check from your own routes.
+ *
+ * The request does not follow redirects: a 3xx answer counts as a failed check. Only the first 64 KiB of an answer
+ * are read, and an answer that completes after `timeoutMs` counts as a timeout.
  *
  * @param options The API key and connection settings, as for {@linkcode signupBouncer}.
- * @param input What to check. Send at least an email or an IP; with neither, the result is allow and no request is made.
+ * @param input What to check. Send at least an email or an IP.
  * @returns The action to take, with the API's answer or the reason the check failed.
  */
 export async function checkSignup(
   options: Pick<SignupBouncerOptions, "apiKey" | "baseUrl" | "app" | "timeoutMs" | "onError">,
   input: {
-    /** The address the person signed up with. */
+    /** The address the person signed up with, exactly as your app saves it. */
     email?: string;
     /** The client IP, if you know it from a header your host overwrites. */
     ip?: string;
@@ -245,11 +213,15 @@ export async function checkSignup(
     userAgent?: string;
     /**
      * The OAuth/SSO provider that verified `email` (`"google"`, `"github"`, ...). signupbouncer then scores only the IP
-     * and signup bursts and keeps the email's domain for your stats. Leave it out for email/password sign-ups.
+     * and signup bursts and keeps the email's domain for your stats. Send it only when the provider marked the email
+     * verified, and leave it out for email/password sign-ups.
      */
     authProvider?: string;
   },
 ): Promise<CheckResult> {
+  if (typeof input.email === "string" && input.email !== "" && !isCheckableEmail(input.email)) {
+    return { ok: false, action: "block", error: { reason: "invalid_email" } };
+  }
   const apiKey = options.apiKey?.trim() ?? "";
   if (!apiKey) return report(options.onError, { reason: "missing_api_key" });
   // A key with a newline or other junk pasted in: fetch would reject the header and quote the key in its error.
@@ -262,10 +234,13 @@ export async function checkSignup(
   if (input.authProvider) body.auth_provider = input.authProvider;
   if (options.app) body.app = options.app;
   // The API needs an email or an IP; with neither there is nothing to check.
-  if (!body.email && !body.ip) return { ok: true, action: "allow", response: { action: "allow" } };
+  if (!body.email && !body.ip) return report(options.onError, { reason: "no_input" });
 
+  const timeoutMs = timeoutOf(options.timeoutMs);
+  const deadline = Date.now() + timeoutMs;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutOf(options.timeoutMs));
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const late = () => controller.signal.aborted || Date.now() > deadline;
   let res: Response;
   try {
     res = await fetch(url, {
@@ -273,6 +248,9 @@ export async function checkSignup(
       headers: { "authorization": `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify(body),
       signal: controller.signal,
+      // Never follow a redirect: it could carry the key and the email to another host (Cloudflare Workers forwards
+      // Authorization on cross-origin redirects). A 3xx is a failed check below.
+      redirect: "manual",
     });
   } catch {
     clearTimeout(timer);
@@ -289,19 +267,32 @@ export async function checkSignup(
       }
       return report(options.onError, { reason: "http_status", status: res.status });
     }
+    let text: string | { failed: string };
+    try {
+      text = await readCapped(res, controller.signal);
+    } catch {
+      return report(options.onError, late() ? { reason: "timeout" } : { reason: "bad_response", status: res.status });
+    }
+    if (typeof text !== "string") {
+      return report(
+        options.onError,
+        text.failed === "aborted" ? { reason: "timeout" } : { reason: "bad_response", status: res.status },
+      );
+    }
     let parsed: unknown;
     try {
-      parsed = await res.json();
+      parsed = JSON.parse(text);
     } catch {
-      if (controller.signal.aborted) return report(options.onError, { reason: "timeout" });
       return report(options.onError, { reason: "bad_response", status: res.status });
     }
-    if (!isCheckResponse(parsed)) return report(options.onError, { reason: "bad_response", status: res.status });
-    return { ok: true, action: parsed.action, response: parsed };
+    if (!isCompleteAnswer(parsed)) return report(options.onError, { reason: "bad_response", status: res.status });
+    // An answer that arrived after the deadline is a timeout, even if the timer has not fired yet.
+    if (late()) return report(options.onError, { reason: "timeout" });
+    const response = parsed as CheckResponse;
+    return { ok: true, action: response.action, response };
   } catch {
     // Anything else that goes wrong while handling the answer still allows the sign-up.
-    if (controller.signal.aborted) return report(options.onError, { reason: "timeout" });
-    return report(options.onError, { reason: "bad_response", status: res.status });
+    return report(options.onError, late() ? { reason: "timeout" } : { reason: "bad_response", status: res.status });
   } finally {
     clearTimeout(timer);
   }
@@ -321,34 +312,23 @@ function blockError(message: string): APIError {
   return new APIError("BAD_REQUEST", { message, code: "SIGNUP_BLOCKED" });
 }
 
-// Paths where a user is created by a provider that has verified the email (OAuth, OIDC, One Tap, SSO).
-const PROVIDER_VERIFIED_PATH = /(^|\/)callback(\/|$)|^\/sign-in\/social$|^\/one-tap\//;
-// Paths the database hook leaves alone: the email sign-up (the before hook checked it), admin-created users and
-// anonymous users (no real email).
-const SKIP_PATH = /^\/sign-up\/email$|^\/admin\/|^\/sign-in\/anonymous$/;
-
-type HookCtx = { path?: string; headers?: Headers; request?: Request; body?: unknown } | null | undefined;
+// Paths where a user is created by a provider that may have verified the email (OAuth, OIDC, One Tap, SSO). Better
+// Auth gives route patterns here, such as "/callback/:id".
+const PROVIDER_PATH = /(^|\/)callback(\/|$)|^\/sign-in\/social$|^\/one-tap\//;
+// Paths the database hook leaves alone: admin-created users and anonymous users (no real email).
+const SKIP_PATH = /^\/admin\/|^\/sign-in\/anonymous$/;
+const EMAIL_SIGNUP = "/sign-up/email";
 
 function headersOf(ctx: HookCtx): Headers | undefined {
   return ctx?.headers ?? ctx?.request?.headers ?? undefined;
 }
 
-const PROVIDER_ID = /^[A-Za-z0-9._:-]{1,40}$/;
-
-/**
- * The provider id for a provider-verified sign-up, sent as `auth_provider`: from `/callback/:id` (social, generic
- * OAuth, SSO), `"google"` for One Tap, the body's `provider` for `/sign-in/social` (ID-token sign-in), else
- * `"oauth"`.
- */
-export function providerFromPath(path: string, body?: unknown): string {
-  let id: unknown = /\/callback\/([^/?#]+)/.exec(path)?.[1];
-  if (id === undefined && /^\/one-tap\//.test(path)) id = "google";
-  if (id === undefined && path === "/sign-in/social") id = (body as { provider?: unknown } | undefined)?.provider;
-  return typeof id === "string" && PROVIDER_ID.test(id) ? id : "oauth";
-}
-
 /**
  * The Better Auth plugin. Add it to `plugins` in your `betterAuth()` config.
+ *
+ * Email/password sign-ups are checked in two places: a before hook checks the address in the request, and a
+ * `user.create.before` database hook checks the user Better Auth is about to save. The second check makes a request
+ * only when the saved address differs from the one already checked, for example when another hook rewrote it.
  *
  * @param options Your API key and settings. See {@linkcode SignupBouncerOptions}.
  * @returns A Better Auth plugin with the id `"signupbouncer"`.
@@ -356,6 +336,11 @@ export function providerFromPath(path: string, body?: unknown): string {
 export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
   const blockMessage = options.blockMessage ?? DEFAULT_BLOCK_MESSAGE;
   const challenge = options.challenge ?? "allow";
+  // The email the before hook checked and allowed, per request. The database hook skips its own request for the same
+  // address. Keyed by the Request (or the Headers when Better Auth is called without one); entries go with the request.
+  const allowedEmail = new WeakMap<object, string>();
+  const requestKey = (ctx: HookCtx): object | undefined => ctx?.request ?? ctx?.headers ?? undefined;
+
   const ipOf = (ctx: HookCtx): string | undefined => {
     const headers = headersOf(ctx);
     if (options.getIp) {
@@ -368,60 +353,63 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
     return clientIp(headers, options.ipHeader, options.trustedProxies);
   };
 
+  const enforce = async (ctx: HookCtx, email: string | undefined, authProvider?: string): Promise<void> => {
+    const ip = ipOf(ctx);
+    if (email === undefined && !ip) return;
+    const result = await checkSignup(options, {
+      email,
+      ip,
+      userAgent: headersOf(ctx)?.get("user-agent") ?? undefined,
+      authProvider,
+    });
+    if (shouldBlock(result, challenge)) throw blockError(blockMessage);
+  };
+
   const plugin = {
     id: "signupbouncer",
     hooks: {
       before: [
         {
-          matcher: (context) => context.path === "/sign-up/email",
+          matcher: (context) => context.path === EMAIL_SIGNUP,
           handler: createAuthMiddleware(async (ctx) => {
             const email = (ctx.body as { email?: unknown } | undefined)?.email;
-            const headers = headersOf(ctx);
-            const ip = ipOf(ctx);
-            if (typeof email !== "string" && !ip) return;
-            const result = await checkSignup(options, {
-              email: typeof email === "string" ? email : undefined,
-              ip,
-              userAgent: headers?.get("user-agent") ?? undefined,
-            });
-            if (shouldBlock(result, challenge)) throw blockError(blockMessage);
+            // Better Auth refuses a missing or non-string email itself; the database hook covers the rest.
+            if (typeof email !== "string") return;
+            await enforce(ctx, email);
+            const key = requestKey(ctx);
+            if (key) allowedEmail.set(key, email.toLowerCase());
           }),
         },
       ],
     },
-    init: options.checkOtherSignups
-      ? () => ({
-        options: {
-          databaseHooks: {
-            user: {
-              create: {
-                before: async (user: { email?: string | null }, ctx?: HookCtx) => {
-                  // No endpoint context means your own server code created the user: not a sign-up to check.
-                  const path = ctx?.path;
-                  if (!path || SKIP_PATH.test(path)) return;
-                  const headers = headersOf(ctx);
-                  const ip = ipOf(ctx);
-                  // OAuth/SSO: the provider verified the email. Send it with the provider id, so signupbouncer
-                  // scores only the IP and signup bursts but still counts the email's domain.
-                  const authProvider = PROVIDER_VERIFIED_PATH.test(path)
-                    ? providerFromPath(path, ctx?.body)
-                    : undefined;
-                  const email = user.email ?? undefined;
-                  if (!email && !ip) return;
-                  const result = await checkSignup(options, {
-                    email,
-                    ip,
-                    userAgent: headers?.get("user-agent") ?? undefined,
-                    authProvider,
-                  });
-                  if (shouldBlock(result, challenge)) throw blockError(blockMessage);
-                },
+    init: () => ({
+      options: {
+        databaseHooks: {
+          user: {
+            create: {
+              before: async (user: { email?: string | null; emailVerified?: boolean | null }, ctx?: HookCtx) => {
+                // No endpoint context means your own server code created the user: not a sign-up to check.
+                const path = ctx?.path;
+                if (!path || SKIP_PATH.test(path)) return;
+                const email = typeof user.email === "string" && user.email !== "" ? user.email : undefined;
+                if (path === EMAIL_SIGNUP) {
+                  const key = requestKey(ctx);
+                  if (email !== undefined && key && allowedEmail.get(key) === email.toLowerCase()) return;
+                  return await enforce(ctx, email);
+                }
+                if (!options.checkOtherSignups) return;
+                // A provider that verified the email: send its id, so signupbouncer scores only the IP and signup
+                // bursts but still counts the email's domain. An unverified email is checked like any other.
+                const authProvider = PROVIDER_PATH.test(path) && user.emailVerified === true
+                  ? providerFor(ctx)
+                  : undefined;
+                return await enforce(ctx, email, authProvider);
               },
             },
           },
         },
-      })
-      : undefined,
+      },
+    }),
   } satisfies BetterAuthPlugin;
   return plugin;
 }

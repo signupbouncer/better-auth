@@ -6,10 +6,7 @@ such as `v0.1.0` runs `.github/workflows/publish.yml`, which publishes to JSR (G
 
 ## One-time setup
 
-1. **Licence holder.** Replace `[FILL: copyright holder]` in `LICENSE` with the legal name that owns the code, and
-   commit.
-
-2. **GitHub repo.** Create the public repo `signupbouncer/better-auth` (empty: no README, licence or .gitignore), then
+1. **GitHub repo.** Create the public repo `signupbouncer/better-auth` (empty: no README, licence or .gitignore), then
    push this one:
 
    ```
@@ -19,12 +16,12 @@ such as `v0.1.0` runs `.github/workflows/publish.yml`, which publishes to JSR (G
 
    Wait for the `ci` workflow to go green on `main` before going further.
 
-3. **JSR scope and package.** Sign in at https://jsr.io with the GitHub account that owns the `signupbouncer` org.
+2. **JSR scope and package.** Sign in at https://jsr.io with the GitHub account that owns the `signupbouncer` org.
    - Create the scope `@signupbouncer` and, in it, the package `better-auth` (https://jsr.io/new).
    - In the package's Settings tab, link it to the GitHub repository `signupbouncer/better-auth`. This is what lets the
      workflow publish with GitHub's OIDC token (https://jsr.io/docs/publishing-packages#publishing-from-github-actions).
 
-4. **npm org and token.**
+3. **npm org and token.**
    - Create the free npm organization `signupbouncer` (https://www.npmjs.com/org/create). This reserves the
      `@signupbouncer` scope.
    - Create a granular access token (https://www.npmjs.com/settings/~/tokens/granular-access-tokens/new):
@@ -48,7 +45,8 @@ such as `v0.1.0` runs `.github/workflows/publish.yml`, which publishes to JSR (G
    ```
 
 3. Watch https://github.com/signupbouncer/better-auth/actions. The `verify` job refuses a tag that does not match
-   `deno.json`. Then `jsr` and `npm` run side by side.
+   `deno.json` or a published file that still holds a `[FILL ...]` placeholder. Then `jsr` publishes while `build-npm`
+   builds the npm package in a job with no publishing rights. `npm` publishes that build after both have succeeded.
 4. Check https://jsr.io/@signupbouncer/better-auth and https://www.npmjs.com/package/@signupbouncer/better-auth.
 
 A version number can be published once on each registry. If one registry fails and the other succeeds, fix the cause and
@@ -63,8 +61,9 @@ deno task publish:check
 deno task build:npm
 ```
 
-`build:npm` writes the npm package to `npm/`. It fills `npm/node_modules` with `deno install`, which runs no npm install
-scripts. The npm CLI runs only inside GitHub Actions.
+`build:npm` writes the npm package to `npm/` in two steps. `npm:deps` fills `npm/node_modules` with `deno install`,
+which runs no npm install scripts. `npm:build` then runs dnt with no permission to start other processes. The npm CLI
+runs only inside GitHub Actions.
 
 ## Later: drop the npm token
 

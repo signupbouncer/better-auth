@@ -29,7 +29,7 @@ npx jsr add @signupbouncer/better-auth
 ```
 
 The plugin has no dependencies of its own. It needs `better-auth` 1.7 or later, which your app already has, as a peer
-dependency.
+dependency. On Node it needs Node 22 or later, as `better-auth` 1.7's own dependencies do.
 
 ## Use
 
@@ -59,28 +59,41 @@ A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "<b
 
 - Checks every `POST /sign-up/email` before Better Auth creates the user. It sends signupbouncer the email, the
   User-Agent and, when you configure a source for it, the client IP.
+- Checks the user Better Auth is about to save as well, through a `user.create.before` database hook. When the saved
+  address is the one already checked, it makes no second request. When another hook in your app changed the address, it
+  checks the new one.
+- Refuses an email longer than 320 characters, or one with spaces or without text on both sides of an `@`, without
+  asking signupbouncer. The API takes at most 320 characters, so a longer address would be cut before the check.
 - Refuses the sign-up when the answer's `action` is `"block"`. A `"challenge"` answer is allowed unless you set
   `challenge: "block"`, because Better Auth has no captcha step to send it to.
 - With `checkOtherSignups: true`, also checks users created by OAuth, magic link, email OTP and other plugins (see
   below).
 
-It leaves alone sign-ins, password resets, sessions and anything else that does not create a user. It stores nothing and
-keeps no state between requests.
+It leaves alone sign-ins, password resets, sessions and anything else that does not create a user. It stores nothing
+between requests.
+
+Your own `databaseHooks.user.create.before` runs after the plugin's. If it changes the email, the plugin has already
+checked the earlier address.
 
 ## When a check fails, the sign-up goes through
 
 Any failure allows the sign-up. That covers a timeout, a network error, a non-2xx answer (such as 401 for a wrong key)
 and an answer that is not a complete `/v1/check` response. Only a complete answer can refuse a sign-up.
 
+The plugin never follows a redirect, so your API key and the email cannot be sent on to another host. A 3xx answer
+counts as a failed check. It reads at most 64 KiB of an answer, and an answer that completes after `timeoutMs` counts as
+a timeout.
+
 Each failure calls `onError` with one of these reasons:
 
 - `timeout`: no full answer within `timeoutMs`.
 - `network`: a DNS, TLS or connection failure.
-- `http_status`: any non-2xx answer (401 bad key, 404 unknown app, 5xx). `status` holds the code.
-- `bad_response`: the body was not JSON, was missing a field the API always sends or had one of the wrong type, or the
-  connection broke while it was being read.
+- `http_status`: any non-2xx answer (3xx redirect, 401 bad key, 404 unknown app, 5xx). `status` holds the code.
+- `bad_response`: the body was not JSON, was larger than 64 KiB, was missing a field the API always sends or had one of
+  the wrong type, or the connection broke while it was being read.
 - `missing_api_key`: `apiKey` was empty. No request was made.
 - `malformed_api_key`: `apiKey` holds a space, newline or other character a key never has. No request was made.
+- `no_input`: `checkSignup` got neither an email nor an IP. No request was made.
 
 Without `onError`, the plugin writes one `console.warn` line per failure, for example:
 
@@ -163,31 +176,34 @@ Better Auth's own rate limiter reads the client IP too and has its own setting f
 
 ### Sign-ups other than email and password
 
-By default the plugin checks `POST /sign-up/email` only, through a `hooks.before` entry. With `checkOtherSignups: true`
-it also adds a `user.create.before` database hook, so it checks every user created through a request: OAuth callbacks,
-ID-token sign-in, One Tap, magic link, email OTP and so on.
+By default the plugin checks email and password sign-ups only. With `checkOtherSignups: true` its database hook checks
+every user created through a request: OAuth callbacks, ID-token sign-in, One Tap, magic link, email OTP and so on.
 
-- OAuth and other provider callbacks (paths containing `/callback`, `/sign-in/social`, `/one-tap/`) send the email with
-  `auth_provider`, the provider id from the path such as `"google"`, plus the IP when you configured one. signupbouncer
-  scores these on the IP and signup bursts only, because the provider has verified the email, and still counts the
-  email's domain in your dashboard.
+- OAuth and other provider sign-ups (`/callback/:id`, `/sign-in/social`, `/one-tap/`) where the provider marked the
+  email verified send the email with `auth_provider`, the provider id such as `"google"`, plus the IP when you
+  configured one. signupbouncer scores these on the IP and signup bursts only, and still counts the email's domain in
+  your dashboard.
+- A provider sign-up whose email the provider did not mark verified is checked like an email sign-up, with no
+  `auth_provider`.
 - Magic link, email OTP and the rest send the email and the IP.
-- The hook skips `/sign-up/email` (the before hook already checked it), `/admin/*` (users your admins create),
-  `/sign-in/anonymous`, and users your own server code creates without a request.
+- The hook skips `/admin/*` (users your admins create), `/sign-in/anonymous`, and users your own server code creates
+  without a request.
 
 A block in a database hook throws the same `APIError`. For redirect flows such as OAuth and magic link, Better Auth
-sends the user to your error callback URL instead of returning JSON. We have tested that path with magic link. On other
-redirect flows the error the user sees depends on the flow and your Better Auth version.
+sends the user to your error callback URL instead of returning JSON. We have tested that path with magic link and a
+generic OAuth provider. On other redirect flows the error the user sees depends on the flow and your Better Auth
+version.
 
 ### Using the check directly
 
-`checkSignup(options, { email, ip, userAgent })` is exported too. It returns `{ ok, action, response | error }` and
-never throws, so you can run the same fail-open check from any route. `shouldBlock(result, challenge)` turns the result
-into a yes or no.
+`checkSignup(options, { email, ip, userAgent, authProvider })` is exported too. It returns
+`{ ok, action, response | error }` and never throws, so you can run the same fail-open check from any route. Pass the
+email exactly as your app saves it, and `authProvider` only when the provider marked the email verified.
+`shouldBlock(result, challenge)` turns the result into a yes or no.
 
 ## Better Auth APIs this plugin uses
 
-Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.7 from npm:
+Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.0 and 1.7.7 from npm:
 
 - Plugin `hooks.before` entries with `matcher` and `createAuthMiddleware` from `better-auth/api`:
   https://better-auth.com/docs/concepts/plugins#hooks
@@ -195,7 +211,8 @@ Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.7 from npm:
 - `databaseHooks.user.create.before`, and throwing `APIError` from it:
   https://better-auth.com/docs/concepts/database#database-hooks. A plugin supplies database hooks by returning
   `{ options: { databaseHooks } }` from its `init` function. The `BetterAuthPlugin` type includes that, and the built-in
-  admin plugin uses it, but the plugin docs page does not describe it.
+  admin plugin uses it, but the plugin docs page does not describe it. Better Auth passes the endpoint context as the
+  hook's second argument, with the route pattern in `path` (`/callback/:id`) and the provider in `params`.
 
 ## Development
 
@@ -203,9 +220,9 @@ Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.7 from npm:
 deno task test           # unit tests, plus a real in-memory Better Auth instance with the signupbouncer API mocked
 deno task check          # fmt, lint, type check
 deno task publish:check  # deno publish --dry-run
-deno task build:npm      # builds the npm package into npm/ (see scripts/build_npm.ts)
+deno task build:npm      # npm package into npm/: npm:deps (deno install, no scripts), then npm:build (dnt)
 ```
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT. Copyright (c) 2026 Final Dynamics LLC, which does business as signupbouncer. See [LICENSE](LICENSE).

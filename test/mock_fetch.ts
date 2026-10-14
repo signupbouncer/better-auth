@@ -4,6 +4,8 @@ export interface Call {
   url: string;
   headers: Headers;
   body: Record<string, unknown>;
+  /** The fetch `redirect` option the caller passed. */
+  redirect: RequestRedirect | undefined;
 }
 
 export type Handler = (call: Call, signal: AbortSignal | undefined) => Response | Promise<Response>;
@@ -16,6 +18,7 @@ export function mockFetch(handler: Handler): { calls: Call[]; restore: () => voi
       url: String(input),
       headers: new Headers(init?.headers),
       body: JSON.parse(String(init?.body ?? "{}")),
+      redirect: init?.redirect,
     };
     calls.push(call);
     return await handler(call, init?.signal ?? undefined);
@@ -27,12 +30,16 @@ export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-/** An answer shaped like the real /v1/check response. */
-export function answer(action: "allow" | "challenge" | "block", verdict = action): Response {
-  return json({
+/** A body shaped like the real /v1/check response. */
+export function answerBody(
+  action: "allow" | "challenge" | "block",
+  verdict: "allow" | "challenge" | "block" = action,
+  mode: "enforce" | "shadow" = "enforce",
+): Record<string, unknown> {
+  return {
     verdict,
     action,
-    mode: "enforce",
+    mode,
     score: action === "allow" ? 0 : 90,
     check_id: "chk_test",
     reasons: action === "allow" ? [] : [{ code: "disposable_domain", detail: "x", points: 100, tier: "free" }],
@@ -41,7 +48,16 @@ export function answer(action: "allow" | "challenge" | "block", verdict = action
     shadow: [],
     latency_ms: 1,
     quota_exceeded: false,
-  });
+  };
+}
+
+/** An answer shaped like the real /v1/check response. */
+export function answer(
+  action: "allow" | "challenge" | "block",
+  verdict: "allow" | "challenge" | "block" = action,
+  mode: "enforce" | "shadow" = "enforce",
+): Response {
+  return json(answerBody(action, verdict, mode));
 }
 
 /** Never answers until the request is aborted, then rejects like fetch does. */

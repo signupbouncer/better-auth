@@ -1,5 +1,5 @@
 # Checks every push and pull request: format, lint, type check, tests, a JSR publish dry run, the npm build, and an
-# import of the built npm package in Node.
+# import of the built npm package in Node 22.0.0 (the lowest version package.json allows) and Node 24.
 #
 # Actions are pinned to full commit SHAs (resolved with `git ls-remote` and checked with the GitHub API on
 # 14 Oct 2026). The comment after each SHA is the release tag it points at.
@@ -30,17 +30,29 @@ jobs:
       - run: deno task build:npm
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24"
-      # better-auth comes from npm/node_modules, which the build filled with `deno install` (no install scripts).
-      - name: Import the npm build in Node
+          node-version: "22.0.0"
+      # better-auth comes from npm/node_modules, which `deno task npm:deps` filled (no install scripts run).
+      - name: Import the npm build in Node 22.0.0
         working-directory: npm
-        run: |
-          node --input-type=module -e '
+        run: node --input-type=module -e "$IMPORT_CHECK"
+        env:
+          IMPORT_CHECK: |
             const m = await import("./esm/mod.js");
             const p = m.signupBouncer({ apiKey: "sb_live_ci" });
             if (p.id !== "signupbouncer" || typeof p.hooks.before[0].handler !== "function") process.exit(1);
-            console.log("exports:", Object.keys(m).sort().join(" "));
-          '
+            console.log(process.version, "exports:", Object.keys(m).sort().join(" "));
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Import the npm build in Node 24
+        working-directory: npm
+        run: node --input-type=module -e "$IMPORT_CHECK"
+        env:
+          IMPORT_CHECK: |
+            const m = await import("./esm/mod.js");
+            const p = m.signupBouncer({ apiKey: "sb_live_ci" });
+            if (p.id !== "signupbouncer" || typeof p.hooks.before[0].handler !== "function") process.exit(1);
+            console.log(process.version, "exports:", Object.keys(m).sort().join(" "));
       - name: List what npm would publish
         working-directory: npm
         run: npm pack --dry-run --ignore-scripts

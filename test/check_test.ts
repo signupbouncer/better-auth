@@ -3,16 +3,14 @@
 import { assert, assertEquals } from "@std/assert";
 import {
   type CheckError,
+  type CheckResponse,
   checkSignup,
-  clientIp,
   DEFAULT_TIMEOUT_MS,
-  isCheckResponse,
   MAX_TIMEOUT_MS,
-  normalizeIp,
   shouldBlock,
-  warnCheckError,
 } from "../mod.ts";
-import { answer, hang, json, mockFetch } from "./mock_fetch.ts";
+import { clientIp, isCompleteAnswer, normalizeIp } from "../internal.ts";
+import { answer, answerBody, hang, json, mockFetch } from "./mock_fetch.ts";
 import { FULL_BLOCK, MALFORMED_BLOCKS, VALID_BLOCKS } from "./responses.ts";
 
 const opts = { apiKey: "sb_live_test", baseUrl: "https://api.example/" };
@@ -44,11 +42,18 @@ Deno.test("block and challenge pass through as the action", async () => {
   }
 });
 
-Deno.test("shadow mode: verdict block but action allow is not blocked", async () => {
-  const m = mockFetch(() => answer("allow", "block"));
+Deno.test("shadow mode: a complete shadow answer (verdict block, action allow) is accepted and not blocked", async () => {
+  const m = mockFetch(() => answer("allow", "block", "shadow"));
   try {
-    const r = await checkSignup(opts, { email: "x@mailinator.com" });
+    const errors: CheckError[] = [];
+    const r = await checkSignup({ ...opts, onError: (e) => errors.push(e) }, { email: "x@mailinator.com" });
+    assertEquals(r.ok, true);
     assertEquals(r.action, "allow");
+    if (r.ok) {
+      assertEquals(r.response.mode, "shadow");
+      assertEquals(r.response.verdict, "block");
+    }
+    assertEquals(errors, []);
     assertEquals(shouldBlock(r, "block"), false);
   } finally {
     m.restore();
@@ -56,11 +61,12 @@ Deno.test("shadow mode: verdict block but action allow is not blocked", async ()
 });
 
 Deno.test("shouldBlock maps challenge by setting", () => {
-  const ch = { ok: true as const, action: "challenge" as const, response: { action: "challenge" as const } };
+  const response = answerBody("challenge") as CheckResponse;
+  const ch = { ok: true as const, action: "challenge" as const, response };
   assertEquals(shouldBlock(ch), false);
   assertEquals(shouldBlock(ch, "allow"), false);
   assertEquals(shouldBlock(ch, "block"), true);
-  assertEquals(shouldBlock({ ok: true, action: "block", response: { action: "block" } }), true);
+  assertEquals(shouldBlock({ ok: true, action: "block", response: answerBody("block") as CheckResponse }), true);
 });
 
 Deno.test("missing IP: the body carries no ip field", async () => {
@@ -223,7 +229,7 @@ Deno.test("#1 only a complete /v1/check answer can block; partial or mistyped an
     try {
       const r = await checkSignup(opts, { email: "a@b.com" });
       assertEquals(r.action, "block", JSON.stringify(body));
-      assertEquals(isCheckResponse(body), true);
+      assertEquals(isCompleteAnswer(body), true);
     } finally {
       m.restore();
     }
@@ -410,7 +416,6 @@ Deno.test("an onError replaces the default warning", async () => {
     const lines = await captureWarn(() => checkSignup({ ...opts, onError: (e) => seen.push(e) }, { email: "a@b.com" }));
     assertEquals(lines, []);
     assertEquals(seen, [{ reason: "http_status", status: 401 }]);
-    assertEquals(warnCheckError.length, 1);
   } finally {
     m.restore();
   }
@@ -440,4 +445,138 @@ Deno.test("timeoutMs: nonsense values use the default; huge values are capped", 
     MAX_TIMEOUT_MS,
     250,
   ]);
+});
+
+// ---- Astra review fixes (P1-1, P1-4, P2-6) --------------------------------------------------------------------------
+
+Deno.test("P1-1 an overlong or malformed email is blocked locally, never sent, never cut", async () => {
+  const m = mockFetch(() => answer("allow"));
+  try {
+    const huge = "a".repeat(66_000) + "@mailinator.com";
+    const at320 = "a".repeat(320 - "@example.com".length) + "@example.com";
+    for (const email of [huge, "a" + at320, "no-at-sign", "@example.com", "a@", "a b@example.com", "a@b.com\n"]) {
+      const errors: CheckError[] = [];
+      const r = await checkSignup({ ...opts, onError: (e) => errors.push(e) }, { email });
+      assertEquals(r, { ok: false, action: "block", error: { reason: "invalid_email" } }, email.slice(0, 40));
+      assertEquals(shouldBlock(r), true);
+      assertEquals(errors, []); // a refused address is not a failed check
+    }
+    assertEquals(m.calls.length, 0);
+    assertEquals(at320.length, 320);
+    assertEquals((await checkSignup(opts, { email: at320 })).action, "allow");
+    assertEquals(m.calls.map((c) => c.body.email), [at320]);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("no email and no IP: no request, onError gets no_input", async () => {
+  const m = mockFetch(() => answer("block"));
+  try {
+    const errors: CheckError[] = [];
+    const r = await checkSignup({ ...opts, onError: (e) => errors.push(e) }, { userAgent: "UA" });
+    assertEquals(r.action, "allow");
+    assertEquals(errors, [{ reason: "no_input" }]);
+    assertEquals(m.calls.length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("P1-4 redirects are never followed: one request, redirect manual, fails open", async () => {
+  for (const status of [301, 302, 303, 307, 308]) {
+    const m = mockFetch(() => new Response(null, { status, headers: { location: "https://evil.example/collect" } }));
+    try {
+      const errors: CheckError[] = [];
+      const r = await checkSignup({ ...opts, onError: (e) => errors.push(e) }, { email: "a@b.com" });
+      assertEquals(r.action, "allow");
+      assertEquals(errors, [{ reason: "http_status", status }]);
+      assertEquals(m.calls.length, 1);
+      assertEquals(m.calls[0].redirect, "manual");
+      assertEquals(m.calls[0].url, "https://api.example/v1/check");
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+Deno.test("P2-6 a body over 64 KiB is cut off and fails open, even a valid block", async () => {
+  const big = JSON.stringify({ ...FULL_BLOCK, padding: "x".repeat(70_000) });
+  const cases: [string, () => Response][] = [
+    ["streamed, no length", () => {
+      const bytes = new TextEncoder().encode(big);
+      return new Response(
+        new ReadableStream({
+          start(ctl) {
+            for (let i = 0; i < bytes.length; i += 8192) ctl.enqueue(bytes.slice(i, i + 8192));
+            ctl.close();
+          },
+        }),
+        { status: 200 },
+      );
+    }],
+    ["declared length", () => new Response(big, { status: 200, headers: { "content-length": String(big.length) } })],
+  ];
+  for (const [name, handler] of cases) {
+    const errors: CheckError[] = [];
+    const m = mockFetch(handler);
+    try {
+      const r = await checkSignup({ ...opts, onError: (e) => errors.push(e) }, { email: "a@b.com" });
+      assertEquals(r.action, "allow", name);
+      assertEquals(errors, [{ reason: "bad_response", status: 200 }], name);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+Deno.test("P2-6 a block that arrives after the deadline is a timeout, even if the body ignores the abort", async () => {
+  const errors: CheckError[] = [];
+  const m = mockFetch(() => {
+    const bytes = new TextEncoder().encode(JSON.stringify(FULL_BLOCK));
+    return new Response(
+      new ReadableStream({
+        start(ctl) {
+          ctl.enqueue(bytes.slice(0, 10));
+          setTimeout(() => {
+            try {
+              ctl.enqueue(bytes.slice(10));
+              ctl.close();
+            } catch {
+              // the plugin cancelled the stream at the deadline, as it should
+            }
+          }, 150); // well after timeoutMs, and this stream never errors on abort
+        },
+      }),
+      { status: 200 },
+    );
+  });
+  try {
+    const started = performance.now();
+    const r = await checkSignup({ ...opts, timeoutMs: 30, onError: (e) => errors.push(e) }, { email: "a@b.com" });
+    assertEquals(r.action, "allow");
+    assertEquals(errors, [{ reason: "timeout" }]);
+    assert(performance.now() - started < 140, "returned at the deadline, not when the body finished");
+    await new Promise((r) => setTimeout(r, 160)); // let the mock's timer finish inside this test
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("P2-6 an answer read and parsed after the deadline, before the timer fires, is a timeout", async () => {
+  const realNow = Date.now;
+  const errors: CheckError[] = [];
+  const m = mockFetch(() => {
+    // Time jumps past the deadline while the answer is handled (a blocked event loop), so the timer has not fired.
+    Date.now = () => realNow() + 60_000;
+    return json(FULL_BLOCK);
+  });
+  try {
+    const r = await checkSignup({ ...opts, timeoutMs: 1000, onError: (e) => errors.push(e) }, { email: "a@b.com" });
+    assertEquals(r.action, "allow");
+    assertEquals(errors, [{ reason: "timeout" }]);
+  } finally {
+    Date.now = realNow;
+    m.restore();
+  }
 });
