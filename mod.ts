@@ -105,7 +105,12 @@ export interface SignupBouncerOptions {
   apiKey: string;
   /** API origin. Default `https://signupbouncer.com`. */
   baseUrl?: string;
-  /** Which of your signupbouncer apps to log the checks under (`app_...`). Default: your first app. */
+  /**
+   * Leave it out: an API key belongs to one app, and its checks are logged under that app. If set, it must be the key's
+   * own app id (`app_...`). Another app's id gets HTTP 403 `app_mismatch`, a failed check, so every sign-up is allowed.
+   * Only older keys, labelled "all apps (older key)" in the dashboard, use it to pick the app (default: your first
+   * app).
+   */
   app?: string;
   /**
    * How long to wait for signupbouncer before allowing the sign-up, in milliseconds. Default 1,500. A value that is

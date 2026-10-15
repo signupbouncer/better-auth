@@ -5,8 +5,9 @@ A [Better Auth](https://better-auth.com) plugin that checks each new sign-up wit
 throwaway email addresses. If signupbouncer is slow or down, the sign-up goes through. By default your users wait at
 most 1.5 seconds on the check.
 
-You need a signupbouncer API key. Create an account at https://signupbouncer.com/signup and copy the key (`sb_live_...`)
-from your dashboard. The full API docs are at https://signupbouncer.com/docs.
+You need a signupbouncer API key. Create an account at https://signupbouncer.com/signup, then choose "Create API key" on
+your app's Integration tab in the dashboard and copy the key (`sb_live_...`). Each key belongs to one app, and the
+checks it makes are logged under that app. The full API docs are at https://signupbouncer.com/docs.
 
 ## Install
 
@@ -88,7 +89,8 @@ Each failure calls `onError` with one of these reasons:
 
 - `timeout`: no full answer within `timeoutMs`.
 - `network`: a DNS, TLS or connection failure.
-- `http_status`: any non-2xx answer (3xx redirect, 401 bad key, 404 unknown app, 5xx). `status` holds the code.
+- `http_status`: any non-2xx answer (3xx redirect, 401 bad key, 403 `app_mismatch`, 404 unknown app, 5xx). `status`
+  holds the code.
 - `bad_response`: the body was not JSON, was larger than 64 KiB, was missing a field the API always sends or had one of
   the wrong type, or the connection broke while it was being read.
 - `missing_api_key`: `apiKey` was empty. No request was made.
@@ -112,7 +114,7 @@ never delays a sign-up, and anything it throws is ignored.
 | ------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | `apiKey`            | required                                         | Your `sb_live_...` key. If it is empty, every sign-up is allowed and `onError` is called.   |
 | `baseUrl`           | `https://signupbouncer.com`                      | API origin.                                                                                 |
-| `app`               | your first app                                   | Which signupbouncer app (`app_...`) to log the checks under.                                |
+| `app`               | the API key's app                                | Leave it out. See "Which app the checks go to".                                             |
 | `timeoutMs`         | `1500`                                           | How long to wait before allowing the sign-up anyway. At most 10,000.                        |
 | `blockMessage`      | "Please sign up with a permanent email address." | Message returned to the client on a block.                                                  |
 | `challenge`         | `"allow"`                                        | What to do when the answer is `"challenge"`: `"allow"` or `"block"`.                        |
@@ -121,6 +123,16 @@ never delays a sign-up, and anything it throws is ignored.
 | `getIp`             | none                                             | `(request, headers) => ip`: your own IP lookup, used instead of `ipHeader`.                 |
 | `onError`           | one `console.warn` line                          | Called with `{ reason, status? }` when a check fails. The sign-up is still allowed.         |
 | `checkOtherSignups` | `false`                                          | Also check users created by OAuth, magic link, email OTP and other plugins (see below).     |
+
+### Which app the checks go to
+
+Each API key belongs to one signupbouncer app, and its checks are logged under that app, so leave `app` out. If you set
+it, it must be the key's own app id (`app_...`). Any other app's id gets HTTP 403 `app_mismatch`, which counts as a
+failed check: every sign-up is allowed and `onError` gets `http_status` 403. To check sign-ups for a second app, create
+a key on that app's Integration tab and use it in that app's config.
+
+Keys made before keys belonged to an app are labelled "all apps (older key)" in the dashboard. Only those keys use `app`
+to pick the app, and without it they log the checks under your first app.
 
 ### The client IP
 
