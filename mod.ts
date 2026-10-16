@@ -61,9 +61,9 @@ export interface CheckError {
 
 /** A complete `/v1/check` answer. The plugin acts on one only when every field below is present and well-typed. */
 export interface CheckResponse {
-  /** The verdict before the app's mode is applied. Never act on it: in shadow mode it can say block. */
+  /** The result before the app's mode is applied. Never act on it: in shadow mode it can say block. */
   verdict: SignupAction;
-  /** What to do: the verdict in enforce mode, always `"allow"` in shadow mode. */
+  /** What to do: the same as `verdict` in enforce mode, always `"allow"` in shadow mode. */
   action: SignupAction;
   /** The app's mode in your signupbouncer dashboard. */
   mode: "shadow" | "enforce";
