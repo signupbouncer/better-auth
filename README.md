@@ -53,8 +53,10 @@ New signupbouncer apps start in **shadow mode**. Every sign-up is checked and lo
 blocked. When the log looks right, switch the app to enforce in the dashboard. The plugin needs no change for that,
 because it acts on the `action` field of the answer. In shadow mode `action` is always `"allow"`.
 
-A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "<blockMessage>" }`. On the client,
-`authClient.signUp.email()` returns it as `error`, so show `error.message`.
+A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "..." }`. On the client,
+`authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one you set on the Rules
+tab of your signupbouncer dashboard. While you keep the default there, it fits the reason: "Did you mean ann@gmail.com?"
+for a typo domain, for example. Set `blockMessage` to use your own message in code instead.
 
 ## What it does
 
@@ -105,24 +107,25 @@ Without `onError`, the plugin writes one `console.warn` line per failure, for ex
 
 The line and the `onError` argument hold only the reason and the status code. They never hold the API key, the email,
 the IP, an exception message or response text, so you can log them whole. Pass your own `onError` to send failures to
-your logger, or `onError: () => {}` to turn the warning off. The plugin does not wait for `onError`, so a slow logger
+your logger, or `onError: () => {}` to turn the warning off. A 403 or 404 warning adds a hint about the `app` option,
+since those come only from an `app` that is not the key's own. The plugin does not wait for `onError`, so a slow logger
 never delays a sign-up, and anything it throws is ignored.
 
 ## Options
 
-| Option              | Default                                          | Meaning                                                                                     |
-| ------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| `apiKey`            | required                                         | Your `sb_live_...` key. If it is empty, every sign-up is allowed and `onError` is called.   |
-| `baseUrl`           | `https://signupbouncer.com`                      | API origin.                                                                                 |
-| `app`               | the API key's app                                | Leave it out. See "Which app the checks go to".                                             |
-| `timeoutMs`         | `1500`                                           | How long to wait before allowing the sign-up anyway. At most 10,000.                        |
-| `blockMessage`      | "Please sign up with a permanent email address." | Message returned to the client on a block.                                                  |
-| `challenge`         | `"allow"`                                        | What to do when the answer is `"challenge"`: `"allow"` or `"block"`.                        |
-| `ipHeader`          | none (email-only checks)                         | The one header your host overwrites with the client IP. See "The client IP".                |
-| `trustedProxies`    | `1`                                              | For X-Forwarded-For on a fixed proxy chain only: the entry this many places from the right. |
-| `getIp`             | none                                             | `(request, headers) => ip`: your own IP lookup, used instead of `ipHeader`.                 |
-| `onError`           | one `console.warn` line                          | Called with `{ reason, status? }` when a check fails. The sign-up is still allowed.         |
-| `checkOtherSignups` | `false`                                          | Also check users created by OAuth, magic link, email OTP and other plugins (see below).     |
+| Option              | Default                                 | Meaning                                                                                     |
+| ------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `apiKey`            | required                                | Your `sb_live_...` key. If it is empty, every sign-up is allowed and `onError` is called.   |
+| `baseUrl`           | `https://signupbouncer.com`             | API origin.                                                                                 |
+| `app`               | the API key's app                       | Leave it out. See "Which app the checks go to".                                             |
+| `timeoutMs`         | `1500`                                  | How long to wait before allowing the sign-up anyway. At most 10,000.                        |
+| `blockMessage`      | the one from your dashboard's Rules tab | Message returned to the client on a block. Set here, it wins over the dashboard.            |
+| `challenge`         | `"allow"`                               | What to do when the answer is `"challenge"`: `"allow"` or `"block"`.                        |
+| `ipHeader`          | none (email-only checks)                | The one header your host overwrites with the client IP. See "The client IP".                |
+| `trustedProxies`    | `1`                                     | For X-Forwarded-For on a fixed proxy chain only: the entry this many places from the right. |
+| `getIp`             | none                                    | `(request, headers) => ip`: your own IP lookup, used instead of `ipHeader`.                 |
+| `onError`           | one `console.warn` line                 | Called with `{ reason, status? }` when a check fails. The sign-up is still allowed.         |
+| `checkOtherSignups` | `false`                                 | Also check users created by OAuth, magic link, email OTP and other plugins (see below).     |
 
 ### Which app the checks go to
 

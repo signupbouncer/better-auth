@@ -2,9 +2,11 @@
 
 import { assert, assertEquals } from "@std/assert";
 import {
+  blockMessage,
   type CheckError,
   type CheckResponse,
   checkSignup,
+  DEFAULT_BLOCK_MESSAGE,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   shouldBlock,
@@ -579,4 +581,43 @@ Deno.test("P2-6 an answer read and parsed after the deadline, before the timer f
     Date.now = realNow;
     m.restore();
   }
+});
+
+Deno.test("403 app_mismatch and 404 unknown_app: the warning hints at the app option, not the key", async () => {
+  for (const [status, error] of [[403, "app_mismatch"], [404, "unknown_app"]] as const) {
+    const m = mockFetch(() => json({ error }, status));
+    try {
+      const lines = await captureWarn(() => checkSignup({ ...opts, app: "app_other" }, { email: "a@b.com" }));
+      assertEquals(lines, [
+        `[signupbouncer] check failed (http_status ${status}), sign-up allowed. ` +
+        "Check the app option: leave it out, or set it to the API key's own app id.",
+      ]);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+Deno.test("#40 blockMessage: the answer's block_message, or the default when it has none or a bad one", async () => {
+  const cases: [unknown, string][] = [
+    ["Did you mean ann@gmail.com?", "Did you mean ann@gmail.com?"],
+    [undefined, DEFAULT_BLOCK_MESSAGE],
+    ["", DEFAULT_BLOCK_MESSAGE],
+    ["   ", DEFAULT_BLOCK_MESSAGE],
+    [42, DEFAULT_BLOCK_MESSAGE],
+    ["x".repeat(501), DEFAULT_BLOCK_MESSAGE],
+  ];
+  for (const [sent, expected] of cases) {
+    const body = { ...answerBody("block"), ...(sent === undefined ? {} : { block_message: sent }) };
+    const m = mockFetch(() => json(body));
+    try {
+      const r = await checkSignup(opts, { email: "ann@gmial.com" });
+      assertEquals([r.ok, shouldBlock(r), blockMessage(r)], [true, true, expected]);
+    } finally {
+      m.restore();
+    }
+  }
+  // A failed check or a locally refused email has no answer to take a message from.
+  const local = await checkSignup(opts, { email: "not-an-address" });
+  assertEquals([local.action, blockMessage(local)], ["block", DEFAULT_BLOCK_MESSAGE]);
 });

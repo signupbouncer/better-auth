@@ -6,9 +6,15 @@ import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { genericOAuth, magicLink } from "better-auth/plugins";
 import { createAuthMiddleware } from "better-auth/api";
-import { type CheckError, checkSignup, signupBouncer, type SignupBouncerOptions } from "../mod.ts";
+import {
+  type CheckError,
+  checkSignup,
+  DEFAULT_BLOCK_MESSAGE,
+  signupBouncer,
+  type SignupBouncerOptions,
+} from "../mod.ts";
 import { providerFor } from "../internal.ts";
-import { answer, type Call, hang, json, mockFetch } from "./mock_fetch.ts";
+import { answer, answerBody, type Call, hang, json, mockFetch } from "./mock_fetch.ts";
 
 const BASE = "http://localhost:3000";
 
@@ -468,6 +474,31 @@ Deno.test("P1-2 + P2-5 real OAuth callback: verified email sends the real provid
     assertEquals(m.calls[1].body, { email: "farm@mailinator.com" });
     assertEquals(unverified.db.user.length, 0);
     assert(unverified.location.startsWith(`${BASE}/error`), unverified.location);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("#40 a blocked sign-up shows the dashboard's block_message; blockMessage in code wins over it", async () => {
+  const sent = "Did you mean ann@gmail.com?";
+  const m = mockApi((email) =>
+    email.startsWith("nomsg") ? answer("block") : json({ ...answerBody("block"), block_message: sent })
+  );
+  try {
+    const cases: [Partial<SignupBouncerOptions>, string, string][] = [
+      [{}, "ann@gmial.com", sent],
+      [{ blockMessage: "No burners, please." }, "ann2@gmial.com", "No burners, please."],
+      [{ blockMessage: "  " }, "ann3@gmial.com", sent],
+      [{}, "nomsg@gmial.com", DEFAULT_BLOCK_MESSAGE],
+    ];
+    for (const [opts, email, expected] of cases) {
+      const { auth, db } = makeAuth(opts);
+      const res = await signUp(auth, email);
+      assertEquals(res.status, 400);
+      const body = await res.json();
+      assertEquals([body.code, body.message], ["SIGNUP_BLOCKED", expected]);
+      assertEquals(db.user.length, 0);
+    }
   } finally {
     m.restore();
   }
