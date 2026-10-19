@@ -15,7 +15,7 @@
   "fmt": { "lineWidth": 120, "exclude": ["npm/", ".dnt/"] },
   "lint": { "rules": { "tags": ["recommended", "jsr"] }, "exclude": ["npm/", ".dnt/"] },
   "tasks": {
-    "test": "deno test --allow-env=NODE_ENV,NODE_DISABLE_COLORS,TERM,TMUX,TF_BUILD,CI,TEAMCITY_VERSION,TERM_PROGRAM,COLORTERM,TEST,BETTER_AUTH_SECRETS,BETTER_AUTH_TELEMETRY_DEBUG,BETTER_AUTH_TELEMETRY_ENDPOINT,BETTER_AUTH_TRUSTED_ORIGINS --allow-read=README.md test/",
+    "test": "deno test --allow-env=NODE_ENV,NODE_DISABLE_COLORS,TERM,TMUX,TF_BUILD,CI,TEAMCITY_VERSION,TERM_PROGRAM,COLORTERM,TEST,BETTER_AUTH_SECRETS,BETTER_AUTH_TELEMETRY_DEBUG,BETTER_AUTH_TELEMETRY_ENDPOINT,BETTER_AUTH_TRUSTED_ORIGINS,AGENT_NAME,APPVEYOR,BUILDKITE,CIRCLECI,DRONE,GITEA_ACTIONS,GITHUB_ACTIONS,GITLAB_CI,TRAVIS --allow-read=README.md test/",
     "check": "deno fmt --check && deno lint && deno check mod.ts test/ scripts/",
     "publish:check": "deno publish --dry-run",
     "npm:deps": "deno run --no-prompt --allow-read=deno.json --allow-write=npm scripts/npm_deps.ts && cd npm && deno install",
