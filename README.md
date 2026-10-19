@@ -54,11 +54,19 @@ blocked. When the log looks right, switch the app to enforce in the dashboard. T
 because it acts on the `action` field of the answer. In shadow mode `action` is always `"allow"`.
 
 A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "..." }`. On the client,
-`authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one you set on the Rules
-tab of your signupbouncer dashboard. While you keep the default there, it fits the reason: "Did you mean ann@gmail.com?"
-for a typo domain, for example. When there is no message from the dashboard, such as for an email the plugin refuses
-without asking (over 320 characters, or not an address), it is "Please sign up with a permanent email address." Set
-`blockMessage` to use your own message in code instead.
+`authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one signupbouncer sends
+with the answer (`block_message`), the same for an email sign-up and for one the database hook refuses. It is the
+message you set on the Rules tab of your signupbouncer dashboard. While you keep the default there, the words fit the
+reason:
+
+- A burner domain: "Please sign up with a permanent email address."
+- A domain that looks like a typo of a big mail provider: "Did you mean ann@gmail.com? Please check your email address
+  and try again."
+- Any other reason, such as a repeat inbox: "We couldn't create your account. Please contact us if you need help."
+
+When the answer has no message, the plugin uses "Please sign up with a permanent email address." That covers an older
+server, a message that is blank, not text or over 500 characters, and an email the plugin refuses without asking (over
+320 characters, or not an address). Set `blockMessage` to use your own message in code. It then wins for every reason.
 
 ## What it does
 
