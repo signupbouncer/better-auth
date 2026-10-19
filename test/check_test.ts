@@ -613,6 +613,8 @@ Deno.test("#40 blockMessage: the answer's block_message, or the default when it 
     try {
       const r = await checkSignup(opts, { email: "ann@gmial.com" });
       assertEquals([r.ok, shouldBlock(r), blockMessage(r)], [true, true, expected]);
+      // A bad block_message is dropped from the answer, so the type CheckResponse promises holds.
+      if (r.ok) assertEquals(r.response.block_message, expected === DEFAULT_BLOCK_MESSAGE ? undefined : expected);
     } finally {
       m.restore();
     }

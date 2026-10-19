@@ -488,7 +488,7 @@ Deno.test("#40 a blocked sign-up shows the dashboard's block_message; blockMessa
     const cases: [Partial<SignupBouncerOptions>, string, string][] = [
       [{}, "ann@gmial.com", sent],
       [{ blockMessage: "No burners, please." }, "ann2@gmial.com", "No burners, please."],
-      [{ blockMessage: "  " }, "ann3@gmial.com", sent],
+      [{ blockMessage: "" }, "ann3@gmial.com", ""],
       [{}, "nomsg@gmial.com", DEFAULT_BLOCK_MESSAGE],
     ];
     for (const [opts, email, expected] of cases) {

@@ -123,8 +123,9 @@ export interface SignupBouncerOptions {
    */
   timeoutMs?: number;
   /**
-   * Message returned to the client when a sign-up is blocked. Leave it out to use the one signupbouncer sends, which you
-   * set on the Rules tab of your dashboard ({@linkcode blockMessage}). Set here, it wins over the dashboard.
+   * Message returned to the client when a sign-up is blocked. Set here, it wins over the dashboard. Leave it out to use
+   * the one signupbouncer sends, which you set on the Rules tab of your dashboard, or {@linkcode DEFAULT_BLOCK_MESSAGE}
+   * when there is none, such as for an email the plugin refuses without a request (see {@linkcode blockMessage}).
    */
   blockMessage?: string;
   /** What to do when the answer is `"challenge"`. Better Auth has no captcha step to send it to. Default `"allow"`. */
@@ -305,6 +306,9 @@ export async function checkSignup(
     // An answer that arrived after the deadline is a timeout, even if the timer has not fired yet.
     if (late()) return report(options.onError, { reason: "timeout" });
     const response = parsed as CheckResponse;
+    // block_message is optional and only ever shown: drop one that is not a message worth showing, rather than fail
+    // the check, so `response.block_message` is always a usable string or absent.
+    if (messageOrUndefined(response.block_message) === undefined) delete response.block_message;
     return { ok: true, action: response.action, response };
   } catch {
     // Anything else that goes wrong while handling the answer still allows the sign-up.
@@ -365,10 +369,6 @@ function headersOf(ctx: HookCtx): Headers | undefined {
  * @returns A Better Auth plugin with the id `"signupbouncer"`.
  */
 export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
-  // Your own message, if not blank. No length cap: it comes from your code, not over the network.
-  const ownMessage = typeof options.blockMessage === "string" && options.blockMessage.trim() !== ""
-    ? options.blockMessage
-    : undefined;
   const challenge = options.challenge ?? "allow";
   // The email the before hook checked and allowed, per request. The database hook skips its own request for the same
   // address. Keyed by the Request (or the Headers when Better Auth is called without one); entries go with the request.
@@ -396,7 +396,7 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
       userAgent: headersOf(ctx)?.get("user-agent") ?? undefined,
       authProvider,
     });
-    if (shouldBlock(result, challenge)) throw blockError(ownMessage ?? blockMessage(result));
+    if (shouldBlock(result, challenge)) throw blockError(options.blockMessage ?? blockMessage(result));
   };
 
   const plugin = {

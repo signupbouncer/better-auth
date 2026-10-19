@@ -56,7 +56,9 @@ because it acts on the `action` field of the answer. In shadow mode `action` is 
 A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "..." }`. On the client,
 `authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one you set on the Rules
 tab of your signupbouncer dashboard. While you keep the default there, it fits the reason: "Did you mean ann@gmail.com?"
-for a typo domain, for example. Set `blockMessage` to use your own message in code instead.
+for a typo domain, for example. When there is no message from the dashboard, such as for an email the plugin refuses
+without asking (over 320 characters, or not an address), it is "Please sign up with a permanent email address." Set
+`blockMessage` to use your own message in code instead.
 
 ## What it does
 
