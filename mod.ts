@@ -183,9 +183,12 @@ function warnCheckError(error: CheckError): void {
   const status = typeof error.status === "number" ? ` ${error.status}` : "";
   const hint = error.reason === "missing_api_key" || error.reason === "malformed_api_key" || error.status === 401
     ? " Check the signupbouncer API key in your config."
-    : error.status === 403 || error.status === 404
-    // 403 app_mismatch or 404 unknown_app: the only 403 and 404 /v1/check sends, both about the `app` option.
+    // 403 app_mismatch and 404 unknown_app are the only 403 and 404 /v1/check sends, both about the `app` option.
+    : error.status === 403
     ? " Check the app option: leave it out, or set it to the API key's own app id."
+    : error.status === 404
+    // Only an older all-apps key gets 404; leaving `app` out would move its checks to the account's first app.
+    ? " Check the app option: set it to an app id from this API key's account."
     : "";
   console.warn(`[signupbouncer] check failed (${error.reason}${status}), sign-up allowed.${hint}`);
 }

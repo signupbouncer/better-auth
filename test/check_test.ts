@@ -584,13 +584,16 @@ Deno.test("P2-6 an answer read and parsed after the deadline, before the timer f
 });
 
 Deno.test("403 app_mismatch and 404 unknown_app: the warning hints at the app option, not the key", async () => {
+  const hints = {
+    403: "Check the app option: leave it out, or set it to the API key's own app id.",
+    404: "Check the app option: set it to an app id from this API key's account.",
+  };
   for (const [status, error] of [[403, "app_mismatch"], [404, "unknown_app"]] as const) {
     const m = mockFetch(() => json({ error }, status));
     try {
       const lines = await captureWarn(() => checkSignup({ ...opts, app: "app_other" }, { email: "a@b.com" }));
       assertEquals(lines, [
-        `[signupbouncer] check failed (http_status ${status}), sign-up allowed. ` +
-        "Check the app option: leave it out, or set it to the API key's own app id.",
+        `[signupbouncer] check failed (http_status ${status}), sign-up allowed. ${hints[status]}`,
       ]);
     } finally {
       m.restore();

@@ -109,9 +109,10 @@ Without `onError`, the plugin writes one `console.warn` line per failure, for ex
 
 The line and the `onError` argument hold only the reason and the status code. They never hold the API key, the email,
 the IP, an exception message or response text, so you can log them whole. Pass your own `onError` to send failures to
-your logger, or `onError: () => {}` to turn the warning off. A 403 or 404 warning adds a hint about the `app` option,
-since those come only from an `app` that is not the key's own. The plugin does not wait for `onError`, so a slow logger
-never delays a sign-up, and anything it throws is ignored.
+your logger, or `onError: () => {}` to turn the warning off. A 403 or 404 warning adds a hint about the `app` option:
+403 means it names another app than the key's own, and 404 (older all-apps keys only) an app id not on the key's
+account. The plugin does not wait for `onError`, so a slow logger never delays a sign-up, and anything it throws is
+ignored.
 
 ## Options
 
