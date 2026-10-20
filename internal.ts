@@ -157,16 +157,77 @@ export type HookCtx =
   | null
   | undefined;
 
+/** The provider ids the generic-OAuth plugin registers, from the `plugins` in the app's Better Auth options. */
+function genericOAuthIds(options: unknown): Set<string> {
+  const ids = new Set<string>();
+  const plugins = (options as { plugins?: unknown } | null | undefined)?.plugins;
+  if (!Array.isArray(plugins)) return ids;
+  for (const plugin of plugins) {
+    const p = plugin as { id?: unknown; options?: { config?: unknown } } | null;
+    if (!p || p.id !== "generic-oauth" || !Array.isArray(p.options?.config)) continue;
+    for (const c of p.options.config) {
+      const id = (c as { providerId?: unknown } | null)?.providerId;
+      if (typeof id === "string") ids.add(id);
+    }
+  }
+  return ids;
+}
+
 /**
- * The provider id for a provider-verified sign-up, sent as `auth_provider`. Better Auth gives the route pattern in
- * `ctx.path` (`/callback/:id`) and the provider in `ctx.params`: `id` for social and generic OAuth callbacks,
- * `providerId` for SSO. One Tap is `"google"`; ID-token sign-in on `/sign-in/social` names it in the body. Anything
- * missing or malformed is `"oauth"`.
+ * The social provider ids whose sign-ups may be sent with `auth_provider` and `email_verified`: the app's own
+ * `socialProviders` (Better Auth's built-in OAuth providers, which take `emailVerified` from the provider's own flag),
+ * resolving a function-valued entry the way Better Auth does at start-up, minus any with `enabled: false` or no config,
+ * and minus every generic-OAuth provider id. A generic-OAuth provider may reuse a built-in id ("google") and then
+ * handles that id's sign-ins in place of the built-in one, whatever the plugin order, so a shadowed id is never trusted.
+ * Read from the options Better Auth passes to the plugin's `init`.
  */
-export function providerFor(ctx: HookCtx): string {
-  const path = ctx?.path ?? "";
-  let id: unknown = ctx?.params?.id ?? ctx?.params?.providerId;
-  if (id === undefined && /^\/one-tap\//.test(path)) id = "google";
-  if (id === undefined && path === "/sign-in/social") id = (ctx?.body as { provider?: unknown } | undefined)?.provider;
-  return typeof id === "string" && PROVIDER_ID.test(id) ? id : "oauth";
+export async function configuredSocialProviders(options: unknown): Promise<Set<string>> {
+  const social = (options as { socialProviders?: unknown } | null | undefined)?.socialProviders;
+  const ids = new Set<string>();
+  if (!social || typeof social !== "object") return ids;
+  const generic = genericOAuthIds(options);
+  for (const [id, entry] of Object.entries(social)) {
+    if (generic.has(id)) continue;
+    let config: unknown = entry;
+    if (typeof entry === "function") {
+      try {
+        config = await entry();
+      } catch {
+        continue; // Better Auth would fail to start; never trust what could not be read
+      }
+    }
+    if (config && typeof config === "object" && (config as { enabled?: unknown }).enabled !== false) ids.add(id);
+  }
+  return ids;
+}
+
+/**
+ * The provider id to send as `auth_provider` for a user created by this request, or `undefined`. Only Better Auth's
+ * core social sign-in routes, and only for a provider in `trusted` (see {@link configuredSocialProviders}): the OAuth
+ * callback `/callback/:id` (the id is in `ctx.params`), ID-token sign-in on `/sign-in/social` (the id is the body's
+ * `provider`) and `/one-tap/callback` (Google). Never an id from an SSO route (`/sso/...`) or a generic-OAuth provider:
+ * those ids are named by the app or, with self-service SSO, by its users, who could pick a name SignupBouncer trusts
+ * and hand it any address. Without a provider, the email is checked like an email sign-up.
+ */
+export function socialProviderFor(ctx: HookCtx, trusted: ReadonlySet<string>): string | undefined {
+  const path = ctx?.path;
+  let id: unknown;
+  if (path === "/callback/:id") id = ctx?.params?.id;
+  else if (path === "/one-tap/callback") id = "google";
+  else if (path === "/sign-in/social") id = (ctx?.body as { provider?: unknown } | undefined)?.provider;
+  return typeof id === "string" && PROVIDER_ID.test(id) && trusted.has(id) ? id : undefined;
+}
+
+/**
+ * `u` when it is a well-formed http(s) URL with a host, at most 2,048 characters, unchanged; otherwise `undefined`.
+ * The same check as SignupBouncer's other helpers, so a bad `why_url` never becomes a link.
+ */
+export function validWhyUrl(u: unknown): string | undefined {
+  if (typeof u !== "string" || u.length > 2048 || !/^https?:\/\/[^\s/\\?#][^\s\\]*$/i.test(u)) return undefined;
+  try {
+    const url = new URL(u);
+    return (url.protocol === "https:" || url.protocol === "http:") && url.hostname !== "" ? u : undefined;
+  } catch {
+    return undefined;
+  }
 }

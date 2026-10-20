@@ -53,11 +53,37 @@ New SignupBouncer apps start in **shadow mode**. Every sign-up is checked and lo
 blocked. When the log looks right, switch the app to enforce in the dashboard. The plugin needs no change for that,
 because it acts on the `action` field of the answer. In shadow mode `action` is always `"allow"`.
 
-A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "..." }`. On the client,
-`authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one SignupBouncer sends
-with the answer (`block_message`), the same for an email sign-up and for one the database hook refuses. It is the
-message you set on the Rules tab of your SignupBouncer dashboard. While you keep the default there, the words fit the
-reason:
+## What a refused user sees
+
+A refused sign-up gets HTTP 400 with this body:
+
+```json
+{
+  "code": "SIGNUP_BLOCKED",
+  "message": "Please sign up with a permanent email address.",
+  "why_url": "https://signupbouncer.com/why/mailinator.com"
+}
+```
+
+On the client, `authClient.signUp.email()` returns that body as `error`. Show `error.message`, and the link when there
+is one:
+
+```tsx
+const { error } = await authClient.signUp.email({ email, password, name });
+// why_url is not in Better Auth's error type, but the client returns every field of the body.
+const whyUrl = (error as { why_url?: string } | null)?.why_url;
+
+// Where your form shows the error (JSX):
+<p role="alert">
+  {error?.message} {whyUrl && <a href={whyUrl}>Why was this refused?</a>}
+</p>;
+```
+
+### The message
+
+The message is the one SignupBouncer sends with the answer (`block_message`), the same for an email sign-up and for one
+the database hook refuses. It is the message you set on the Rules tab of your SignupBouncer dashboard. While you keep
+the default there, the words fit the reason:
 
 - A burner domain: "Please sign up with a permanent email address."
 - A domain that looks like a typo of a big mail provider: "Did you mean ann@gmail.com? Please check your email address
@@ -67,6 +93,21 @@ reason:
 When the answer has no message, the plugin uses "Please sign up with a permanent email address." That covers an older
 server, a message that is blank, not text or over 500 characters, and an email the plugin refuses without asking (over
 320 characters, or not an address). Set `blockMessage` to use your own message in code. It then wins for every reason.
+
+### The "Why was this refused?" link
+
+`why_url` is there only when you turn the link on. Open Advanced on the Rules tab of your SignupBouncer dashboard and
+switch on "Add a 'Why was this refused?' link". The link goes to our page about the email's domain, such as
+https://signupbouncer.com/why/mailinator.com. That page says what we know about the domain and how to sign up another
+way. It never shows your settings or your checks, and the link carries the domain only, never the full address.
+
+- With the setting off, the body has no `why_url` key. Your form shows the message alone.
+- The plugin passes the link on exactly as SignupBouncer sent it, and only when it is a well-formed `http` or `https`
+  URL. Anything else is dropped, and the sign-up is still refused.
+- The link follows the dashboard setting, so it is there with a `blockMessage` set in code too.
+- An email the plugin refuses without asking (over 320 characters, or not an address) gets no link.
+- OAuth and magic-link sign-ups refused by the database hook end in a redirect, not this body. See "Sign-ups other than
+  email and password".
 
 ## What it does
 
@@ -205,27 +246,35 @@ Better Auth's own rate limiter reads the client IP too and has its own setting f
 By default the plugin checks email and password sign-ups only. With `checkOtherSignups: true` its database hook checks
 every user created through a request: OAuth callbacks, ID-token sign-in, One Tap, magic link, email OTP and so on.
 
-- OAuth and other provider sign-ups (`/callback/:id`, `/sign-in/social`, `/one-tap/`) where the provider marked the
-  email verified send the email with `auth_provider`, the provider id such as `"google"`, plus the IP when you
-  configured one. SignupBouncer scores these on the IP and signup bursts only, and still counts the email's domain in
-  your dashboard.
-- A provider sign-up whose email the provider did not mark verified is checked like an email sign-up, with no
-  `auth_provider`.
+- A sign-up through one of your `socialProviders` (Google, GitHub, Apple and the other providers built into Better Auth)
+  sends the email with `auth_provider`, the provider id such as `"google"`, and `email_verified`. That is Better Auth's
+  own `emailVerified` flag from the provider, never something the user typed. The plugin covers the OAuth callback
+  (`/callback/:id`), ID-token sign-in (`/sign-in/social`) and Google One Tap.
+- When `email_verified` is `true`, SignupBouncer scores the sign-up on the IP and signup bursts only. An email rule,
+  such as one for a burner domain, cannot refuse it. We still count the email's domain in your dashboard.
+- When the provider did not verify the address, `email_verified` is `false` and the email is checked like an email
+  sign-up.
+- Generic OAuth providers (the `genericOAuth` plugin) and SSO providers send the email without `auth_provider`, so the
+  email is always checked. Their ids are names your app or, with self-service SSO, your users pick, so a sign-up through
+  one never skips the email checks. The same goes for a generic provider that reuses a built-in id such as `"google"`.
 - Magic link, email OTP and the rest send the email and the IP.
 - The hook skips `/admin/*` (users your admins create), `/sign-in/anonymous`, and users your own server code creates
   without a request.
 
-A block in a database hook throws the same `APIError`. For redirect flows such as OAuth and magic link, Better Auth
-sends the user to your error callback URL instead of returning JSON. We have tested that path with magic link and a
-generic OAuth provider. On other redirect flows the error the user sees depends on the flow and your Better Auth
-version.
+A block in a database hook throws the same `APIError`. ID-token sign-in answers with the JSON body above, `why_url`
+included. The OAuth callback and magic link are redirects instead: Better Auth sends the user to your error callback URL
+with `?error=SIGNUP_BLOCKED&error_description=<the message>`. It drops every other field of the error, so a redirect
+never carries the "Why was this refused?" link. Show `error_description` on that page. We have tested the redirect with
+Google, a generic OAuth provider and magic link. On other redirect flows the error the user sees depends on the flow and
+your Better Auth version.
 
 ### Using the check directly
 
-`checkSignup(options, { email, ip, userAgent, authProvider })` is exported too. It returns
+`checkSignup(options, { email, ip, userAgent, authProvider, emailVerified })` is exported too. It returns
 `{ ok, action, response | error }` and never throws, so you can run the same fail-open check from any route. Pass the
-email exactly as your app saves it, and `authProvider` only when the provider marked the email verified.
-`shouldBlock(result, challenge)` turns the result into a yes or no.
+email exactly as your app saves it. For an OAuth or SSO sign-up, pass the provider id as `authProvider` and your auth
+library's own verified flag as `emailVerified`. `shouldBlock(result, challenge)` turns the result into a yes or no.
+`blockMessage(result)` gives the message to show and `whyUrl(result)` the link, or `null` without one.
 
 ## Better Auth APIs this plugin uses
 

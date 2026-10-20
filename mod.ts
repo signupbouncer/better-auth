@@ -1,7 +1,9 @@
 /**
  * signupbouncer plugin for Better Auth. It checks each new email sign-up with signupbouncer's `/v1/check` API and
  * refuses the ones signupbouncer says to block. If signupbouncer is slow, down or sends anything unexpected (including
- * an answer missing a field the API always sends), the sign-up goes through (fail open).
+ * an answer missing a field the API always sends), the sign-up goes through (fail open). A refused sign-up gets HTTP
+ * 400 with `{ code: "SIGNUP_BLOCKED", message }`, plus `why_url` when you turn on the "Why was this refused?" link on
+ * the Rules tab of your dashboard.
  *
  * ```ts
  * import { betterAuth } from "better-auth";
@@ -27,12 +29,14 @@ import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import {
   clientIp,
+  configuredSocialProviders,
   type HookCtx,
   isCheckableEmail,
   isCompleteAnswer,
   normalizeIp,
-  providerFor,
   readCapped,
+  socialProviderFor,
+  validWhyUrl,
 } from "./internal.ts";
 
 /** What signupbouncer says to do with a sign-up. In shadow mode this is always `"allow"`. */
@@ -88,6 +92,12 @@ export interface CheckResponse {
    * the default there, one worded for the reason (such as "Did you mean ...?" for a typo domain).
    */
   block_message?: string;
+  /**
+   * Sent with `block_message` only when you turn on "Add a 'Why was this refused?' link" on the Rules tab of your
+   * dashboard: SignupBouncer's page about the email's domain (`/why/<domain>`). Show it after the message. The plugin
+   * drops a value that is not a well-formed http(s) URL, so when present it is always one.
+   */
+  why_url?: string;
   /** Fields added to the API later. */
   [key: string]: unknown;
 }
@@ -158,10 +168,12 @@ export interface SignupBouncerOptions {
   onError?: (error: CheckError) => unknown;
   /**
    * Also check users created outside `/sign-up/email` (OAuth callbacks, magic link, email OTP and other plugins),
-   * through a `user.create.before` database hook. An OAuth sign-up whose provider marked the email verified is sent
-   * with `auth_provider` (the provider id, such as `"google"`): signupbouncer scores it on IP and signup bursts only and
-   * counts the email's domain in your dashboard. One with an unverified email is checked like an email sign-up.
-   * Default `false`.
+   * through a `user.create.before` database hook. A sign-up through one of your `socialProviders` (Google, GitHub and
+   * the other providers built into Better Auth) is sent with `auth_provider` (the provider id, such as `"google"`) and
+   * `email_verified`, Better Auth's own flag that the provider verified the address. When that is `true`, signupbouncer
+   * scores the sign-up on IP and signup bursts only and counts the email's domain in your dashboard; when it is
+   * `false`, the email is checked too. Every other sign-up, SSO and generic OAuth included, has its email checked like
+   * an email sign-up. Default `false`.
    */
   checkOtherSignups?: boolean;
 }
@@ -232,11 +244,17 @@ export async function checkSignup(
     /** The request's User-Agent header. Cut to 512 characters. */
     userAgent?: string;
     /**
-     * The OAuth/SSO provider that verified `email` (`"google"`, `"github"`, ...). signupbouncer then scores only the IP
-     * and signup bursts and keeps the email's domain for your stats. Send it only when the provider marked the email
-     * verified, and leave it out for email/password sign-ups.
+     * For OAuth/SSO sign-ups: the provider id (`"google"`, `"github"`, ...). Send it with `emailVerified`, and leave
+     * it out for email/password sign-ups.
      */
     authProvider?: string;
+    /**
+     * With `authProvider`: your auth library's own flag that the provider verified `email` (Better Auth's
+     * `user.emailVerified` from the OAuth profile), never something the user typed. Only when it is `true` and
+     * signupbouncer knows the provider does it score just the IP and signup bursts, keeping the email's domain for your
+     * stats; missing or `false`, the email is checked too.
+     */
+    emailVerified?: boolean;
   },
 ): Promise<CheckResult> {
   if (typeof input.email === "string" && input.email !== "" && !isCheckableEmail(input.email)) {
@@ -247,11 +265,12 @@ export async function checkSignup(
   // A key with a newline or other junk pasted in: fetch would reject the header and quote the key in its error.
   if (!/^[\x21-\x7e]+$/.test(apiKey)) return report(options.onError, { reason: "malformed_api_key" });
   const url = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "") + "/v1/check";
-  const body: Record<string, string> = {};
+  const body: Record<string, string | boolean> = {};
   if (input.email) body.email = input.email;
   if (input.ip) body.ip = input.ip;
   if (input.userAgent) body.user_agent = input.userAgent.slice(0, 512);
   if (input.authProvider) body.auth_provider = input.authProvider;
+  if (input.emailVerified === true || input.emailVerified === false) body.email_verified = input.emailVerified;
   if (options.app) body.app = options.app;
   // The API needs an email or an IP; with neither there is nothing to check.
   if (!body.email && !body.ip) return report(options.onError, { reason: "no_input" });
@@ -312,6 +331,8 @@ export async function checkSignup(
     // block_message is optional and only ever shown: drop one that is not a message worth showing, rather than fail
     // the check, so `response.block_message` is always a usable string or absent.
     if (messageOrUndefined(response.block_message) === undefined) delete response.block_message;
+    // The same for why_url: a value that is not a well-formed http(s) link is dropped, never shown.
+    if (validWhyUrl(response.why_url) === undefined) delete response.why_url;
     return { ok: true, action: response.action, response };
   } catch {
     // Anything else that goes wrong while handling the answer still allows the sign-up.
@@ -341,18 +362,28 @@ export function blockMessage(result: CheckResult): string {
   return messageOrUndefined(result.ok ? result.response.block_message : undefined) ?? DEFAULT_BLOCK_MESSAGE;
 }
 
+/**
+ * The "Why was this refused?" link to show after {@linkcode blockMessage}: SignupBouncer's page about the email's
+ * domain. signupbouncer sends it with a block or challenge answer only when you turn the link on in the Rules tab of
+ * your dashboard. Otherwise, for a failed check and for an email refused locally, it is `null`. Only a well-formed
+ * http(s) URL with a host counts, returned unchanged.
+ *
+ * @param result A result from {@linkcode checkSignup}.
+ */
+export function whyUrl(result: CheckResult): string | null {
+  return validWhyUrl(result.ok ? result.response.why_url : undefined) ?? null;
+}
+
 // A message worth showing: a non-blank string of at most 500 characters (the dashboard allows 200).
 function messageOrUndefined(m: unknown): string | undefined {
   return typeof m === "string" && m.trim() !== "" && m.length <= 500 ? m : undefined;
 }
 
-function blockError(message: string): APIError {
-  return new APIError("BAD_REQUEST", { message, code: "SIGNUP_BLOCKED" });
+// The error a refused sign-up gets: HTTP 400 with { code, message } and, when the answer carries the "Why was this
+// refused?" link, why_url next to them (the same field name as SignupBouncer's copy-paste Better Auth hook).
+function blockError(message: string, why: string | null): APIError {
+  return new APIError("BAD_REQUEST", { message, code: "SIGNUP_BLOCKED", ...(why ? { why_url: why } : {}) });
 }
-
-// Paths where a user is created by a provider that may have verified the email (OAuth, OIDC, One Tap, SSO). Better
-// Auth gives route patterns here, such as "/callback/:id".
-const PROVIDER_PATH = /(^|\/)callback(\/|$)|^\/sign-in\/social$|^\/one-tap\//;
 // Paths the database hook leaves alone: admin-created users and anonymous users (no real email).
 const SKIP_PATH = /^\/admin\/|^\/sign-in\/anonymous$/;
 const EMAIL_SIGNUP = "/sign-up/email";
@@ -390,16 +421,22 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
     return clientIp(headers, options.ipHeader, options.trustedProxies);
   };
 
-  const enforce = async (ctx: HookCtx, email: string | undefined, authProvider?: string): Promise<void> => {
+  const enforce = async (
+    ctx: HookCtx,
+    email: string | undefined,
+    provider?: { authProvider: string; emailVerified: boolean },
+  ): Promise<void> => {
     const ip = ipOf(ctx);
     if (email === undefined && !ip) return;
     const result = await checkSignup(options, {
       email,
       ip,
       userAgent: headersOf(ctx)?.get("user-agent") ?? undefined,
-      authProvider,
+      authProvider: provider?.authProvider,
+      emailVerified: provider?.emailVerified,
     });
-    if (shouldBlock(result, challenge)) throw blockError(options.blockMessage ?? blockMessage(result));
+    // The link follows the dashboard setting, so it is passed on with a blockMessage set in code too.
+    if (shouldBlock(result, challenge)) throw blockError(options.blockMessage ?? blockMessage(result), whyUrl(result));
   };
 
   const plugin = {
@@ -419,34 +456,42 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
         },
       ],
     },
-    init: () => ({
-      options: {
-        databaseHooks: {
-          user: {
-            create: {
-              before: async (user: { email?: string | null; emailVerified?: boolean | null }, ctx?: HookCtx) => {
-                // No endpoint context means your own server code created the user: not a sign-up to check.
-                const path = ctx?.path;
-                if (!path || SKIP_PATH.test(path)) return;
-                const email = typeof user.email === "string" && user.email !== "" ? user.email : undefined;
-                if (path === EMAIL_SIGNUP) {
-                  const key = requestKey(ctx);
-                  if (email !== undefined && key && allowedEmail.get(key) === email.toLowerCase()) return;
-                  return await enforce(ctx, email);
-                }
-                if (!options.checkOtherSignups) return;
-                // A provider that verified the email: send its id, so signupbouncer scores only the IP and signup
-                // bursts but still counts the email's domain. An unverified email is checked like any other.
-                const authProvider = PROVIDER_PATH.test(path) && user.emailVerified === true
-                  ? providerFor(ctx)
-                  : undefined;
-                return await enforce(ctx, email, authProvider);
+    init: async (authCtx?: { options?: unknown }) => {
+      // Read once: the app's socialProviders and plugins are fixed when Better Auth starts.
+      const social = options.checkOtherSignups ? await configuredSocialProviders(authCtx?.options) : new Set<string>();
+      return {
+        options: {
+          databaseHooks: {
+            user: {
+              create: {
+                before: async (user: { email?: string | null; emailVerified?: unknown }, ctx?: HookCtx) => {
+                  // No endpoint context means your own server code created the user: not a sign-up to check.
+                  const path = ctx?.path;
+                  if (!path || SKIP_PATH.test(path)) return;
+                  const email = typeof user.email === "string" && user.email !== "" ? user.email : undefined;
+                  if (path === EMAIL_SIGNUP) {
+                    const key = requestKey(ctx);
+                    if (email !== undefined && key && allowedEmail.get(key) === email.toLowerCase()) return;
+                    return await enforce(ctx, email);
+                  }
+                  if (!options.checkOtherSignups) return;
+                  // One of the app's own social providers: send its id with Better Auth's emailVerified from the
+                  // provider, so signupbouncer can score only the IP and signup bursts when the provider verified the
+                  // address, and still count the email's domain. Anything else, SSO and generic OAuth included, has its
+                  // email checked.
+                  const authProvider = socialProviderFor(ctx, social);
+                  return await enforce(
+                    ctx,
+                    email,
+                    authProvider ? { authProvider, emailVerified: user.emailVerified === true } : undefined,
+                  );
+                },
               },
             },
           },
         },
-      },
-    }),
+      };
+    },
   } satisfies BetterAuthPlugin;
   return plugin;
 }
