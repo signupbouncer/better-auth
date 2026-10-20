@@ -456,9 +456,9 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
         },
       ],
     },
-    init: async (authCtx?: { options?: unknown }) => {
-      // Read once: the app's socialProviders and plugins are fixed when Better Auth starts.
-      const social = options.checkOtherSignups ? await configuredSocialProviders(authCtx?.options) : new Set<string>();
+    init: (authCtx?: unknown) => {
+      // Read once, from the providers Better Auth resolved at start-up: they are fixed while it runs.
+      const social = options.checkOtherSignups ? configuredSocialProviders(authCtx) : new Set<string>();
       return {
         options: {
           databaseHooks: {

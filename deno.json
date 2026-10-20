@@ -10,7 +10,7 @@
     "@deno/dnt": "jsr:@deno/dnt@0.44.0"
   },
   "publish": {
-    "include": ["mod.ts", "internal.ts", "README.md", "LICENSE"]
+    "include": ["mod.ts", "internal.ts", "README.md", "CHANGELOG.md", "LICENSE"]
   },
   "fmt": { "lineWidth": 120, "exclude": ["npm/", ".dnt/"] },
   "lint": { "rules": { "tags": ["recommended", "jsr"] }, "exclude": ["npm/", ".dnt/"] },

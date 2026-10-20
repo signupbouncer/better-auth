@@ -172,6 +172,28 @@ Deno.test("#210 a function-valued socialProviders entry is trusted like an objec
   }
 });
 
+Deno.test("#210 review: a config function that fails or hangs on a second call is never called again", async () => {
+  // Better Auth calls a function-valued entry once, before plugin init. A second call (a secret store that is down,
+  // say) must not drop Google from the trusted providers, or this verified user would be refused by the email rule.
+  for (const second of ["throws", "hangs"]) {
+    let calls = 0;
+    const google = () => {
+      calls++;
+      if (calls === 1) return Promise.resolve(googleConfig(BURNER, true));
+      return second === "throws" ? Promise.reject(new Error("secret store unavailable")) : new Promise(() => {});
+    };
+    const net = mockNetwork();
+    try {
+      const r = await redirectSignup({ google }, [bouncer()]);
+      assertEquals(calls, 1, second);
+      assertEquals(net.checks, [{ email: BURNER, auth_provider: "google", email_verified: true }], second);
+      assertEquals(r.users.length, 1, second);
+    } finally {
+      net.restore();
+    }
+  }
+});
+
 Deno.test("#210 a generic-OAuth provider named google is never sent as google, before or after the plugin", async () => {
   for (const order of ["generic first", "generic last"]) {
     const net = mockNetwork();

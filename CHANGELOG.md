@@ -25,7 +25,9 @@ refused?" link you turn on in your dashboard.
 - **Tests and README for the per-reason message** (finaldynamics/signupbouncer#185, signupbouncer/better-auth#1): both
   checks show the `block_message` SignupBouncer sends for each reason, and `blockMessage` in code wins for every one.
   The README lists the three default messages and has a new section, "What a refused user sees".
-- The plugin's `init` is now async. It reads your `socialProviders` and `plugins` once, when Better Auth starts.
+- The plugin reads which providers you enabled once, when Better Auth starts, from the providers Better Auth has already
+  set up. It never calls a function-valued `socialProviders` entry itself.
+- The changelog now ships with the package on JSR and npm.
 
 ## 0.1.0
 

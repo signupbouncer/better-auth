@@ -175,28 +175,36 @@ function genericOAuthIds(options: unknown): Set<string> {
 
 /**
  * The social provider ids whose sign-ups may be sent with `auth_provider` and `email_verified`: the app's own
- * `socialProviders` (Better Auth's built-in OAuth providers, which take `emailVerified` from the provider's own flag),
- * resolving a function-valued entry the way Better Auth does at start-up, minus any with `enabled: false` or no config,
- * and minus every generic-OAuth provider id. A generic-OAuth provider may reuse a built-in id ("google") and then
- * handles that id's sign-ins in place of the built-in one, whatever the plugin order, so a shadowed id is never trusted.
- * Read from the options Better Auth passes to the plugin's `init`.
+ * `socialProviders` (Better Auth's built-in OAuth providers, which take `emailVerified` from the provider's own flag)
+ * that Better Auth enabled at start-up, minus every generic-OAuth provider id.
+ *
+ * Read from the context Better Auth passes to the plugin's `init`. By then Better Auth has called each function-valued
+ * `socialProviders` entry and left out the ones with `enabled: false` or no config, and `ctx.socialProviders` holds the
+ * resulting providers. The plugin reads their ids and never calls a config function itself, so a factory that fails or
+ * hangs on a second call cannot change which providers are trusted or stall start-up.
+ *
+ * An id counts only when it is also a key of `options.socialProviders`, so a provider another plugin adds is not
+ * trusted. A generic-OAuth provider may reuse a built-in id ("google") and then handles that id's sign-ins in place of
+ * the built-in one, whatever the plugin order, so a generic id, or an id that appears twice, is never trusted.
  */
-export async function configuredSocialProviders(options: unknown): Promise<Set<string>> {
-  const social = (options as { socialProviders?: unknown } | null | undefined)?.socialProviders;
+export function configuredSocialProviders(authCtx: unknown): Set<string> {
+  const ctx = authCtx as { socialProviders?: unknown; options?: unknown } | null | undefined;
   const ids = new Set<string>();
-  if (!social || typeof social !== "object") return ids;
-  const generic = genericOAuthIds(options);
-  for (const [id, entry] of Object.entries(social)) {
-    if (generic.has(id)) continue;
-    let config: unknown = entry;
-    if (typeof entry === "function") {
-      try {
-        config = await entry();
-      } catch {
-        continue; // Better Auth would fail to start; never trust what could not be read
-      }
-    }
-    if (config && typeof config === "object" && (config as { enabled?: unknown }).enabled !== false) ids.add(id);
+  const resolved = ctx?.socialProviders;
+  const configured = (ctx?.options as { socialProviders?: unknown } | null | undefined)?.socialProviders;
+  if (!Array.isArray(resolved) || !configured || typeof configured !== "object") return ids;
+  const generic = genericOAuthIds(ctx?.options);
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const provider of resolved) {
+    // An entry that is not a provider object (Better Auth's own lookups allow a function here) is never called.
+    const id = provider && typeof provider === "object" ? (provider as { id?: unknown }).id : undefined;
+    if (typeof id !== "string") continue;
+    if (seen.has(id)) repeated.add(id);
+    seen.add(id);
+  }
+  for (const id of seen) {
+    if (Object.hasOwn(configured, id) && !generic.has(id) && !repeated.has(id)) ids.add(id);
   }
   return ids;
 }

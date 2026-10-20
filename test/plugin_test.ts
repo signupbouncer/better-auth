@@ -239,8 +239,11 @@ Deno.test("checkOtherSignups: a real magic-link sign-up is checked and blocked; 
   }
 });
 
-// What Better Auth passes to a plugin's init: its options, here with Google and GitHub as the app's social providers.
-const SOCIAL = { options: { socialProviders: { google: { clientId: "g" }, github: { clientId: "gh" } } } };
+// What Better Auth passes to a plugin's init: the resolved providers and its options, here Google and GitHub.
+const SOCIAL = {
+  socialProviders: [{ id: "google" }, { id: "github" }],
+  options: { socialProviders: { google: { clientId: "g" }, github: { clientId: "gh" } } },
+};
 
 Deno.test("database hook: blocks other paths; a social OAuth sign-up sends the provider and email_verified", async () => {
   const plugin = signupBouncer({
@@ -344,22 +347,49 @@ Deno.test("socialProviderFor: only Better Auth's social routes, only for a trust
   assertEquals(socialProviderFor(undefined, trusted), undefined);
 });
 
-Deno.test("configuredSocialProviders: enabled social providers, minus any a generic-OAuth provider shadows", async () => {
+Deno.test("configuredSocialProviders: providers Better Auth enabled, minus generic-OAuth, repeated or added ids", () => {
   const generic = { id: "generic-oauth", options: { config: [{ providerId: "github" }, { providerId: "acme" }] } };
-  const ids = await configuredSocialProviders({
-    socialProviders: {
-      google: { clientId: "g" },
-      apple: () => Promise.resolve({ clientId: "a" }), // function-valued, as Better Auth allows
-      github: { clientId: "gh" }, // shadowed by the generic-OAuth provider of the same id
-      discord: { clientId: "d", enabled: false },
-      gitlab: undefined,
-      twitch: () => Promise.reject(new Error("bad config")),
+  let called = 0;
+  const factory = () => {
+    called++;
+    return Promise.resolve({ clientId: "a" });
+  };
+  const ids = configuredSocialProviders({
+    // What Better Auth resolved before plugin init: disabled discord is not there; generic-OAuth's init may have
+    // added its own providers (acme, and a github that shadows the built-in one).
+    socialProviders: [
+      { id: "acme" },
+      { id: "github" },
+      { id: "google" },
+      { id: "apple" },
+      { id: "github" },
+      { id: "twitch" }, // added by some other plugin, not in options.socialProviders
+      () => ({ id: "x" }),
+      null,
+    ],
+    options: {
+      socialProviders: {
+        google: { clientId: "g" },
+        apple: factory, // function-valued: already resolved by Better Auth, never called again here
+        github: { clientId: "gh" },
+        discord: { clientId: "d", enabled: false },
+      },
+      plugins: [{ id: "magic-link" }, generic],
     },
-    plugins: [{ id: "magic-link" }, generic],
   });
   assertEquals([...ids].sort(), ["apple", "google"]);
-  assertEquals((await configuredSocialProviders(undefined)).size, 0);
-  assertEquals((await configuredSocialProviders({ socialProviders: "x" })).size, 0);
+  assertEquals(called, 0);
+  // A provider repeated by a plugin other than generic-OAuth is not trusted either.
+  assertEquals(
+    [...configuredSocialProviders({
+      socialProviders: [{ id: "google" }, { id: "google" }],
+      options: { socialProviders: { google: {} } },
+    })],
+    [],
+  );
+  assertEquals(configuredSocialProviders(undefined).size, 0);
+  assertEquals(configuredSocialProviders({ options: { socialProviders: { google: {} } } }).size, 0);
+  assertEquals(configuredSocialProviders({ socialProviders: [{ id: "google" }] }).size, 0);
 });
 
 Deno.test("checkSignup sends auth_provider and email_verified only when given", async () => {
