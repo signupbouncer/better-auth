@@ -1,11 +1,11 @@
 # @signupbouncer/better-auth
 
 A [Better Auth](https://better-auth.com) plugin that checks each new sign-up with
-[signupbouncer](https://signupbouncer.com) and refuses the ones signupbouncer says to block, such as sign-ups from
-throwaway email addresses. If signupbouncer is slow or down, the sign-up goes through. By default your users wait at
+[SignupBouncer](https://signupbouncer.com) and refuses the ones SignupBouncer says to block, such as sign-ups from
+throwaway email addresses. If SignupBouncer is slow or down, the sign-up goes through. By default your users wait at
 most 1.5 seconds on the check.
 
-You need a signupbouncer API key. Create an account at https://signupbouncer.com/signup, then choose "Create API key" on
+You need a SignupBouncer API key. Create an account at https://signupbouncer.com/signup, then choose "Create API key" on
 your app's Integration tab in the dashboard and copy the key (`sb_live_...`). Each key belongs to one app, and the
 checks it makes are logged under that app. The full API docs are at https://signupbouncer.com/docs.
 
@@ -42,33 +42,41 @@ export const auth = betterAuth({
   emailAndPassword: { enabled: true },
   plugins: [
     signupBouncer({
-      apiKey: process.env.SIGNUPBOUNCER_API_KEY!, // sb_live_..., from your signupbouncer dashboard
+      apiKey: process.env.SIGNUPBOUNCER_API_KEY!, // sb_live_..., from your SignupBouncer dashboard
       // ipHeader: "cf-connecting-ip", // the header your host sets to the client IP. See "The client IP".
     }),
   ],
 });
 ```
 
-New signupbouncer apps start in **shadow mode**. Every sign-up is checked and logged in your dashboard, and none is
+New SignupBouncer apps start in **shadow mode**. Every sign-up is checked and logged in your dashboard, and none is
 blocked. When the log looks right, switch the app to enforce in the dashboard. The plugin needs no change for that,
 because it acts on the `action` field of the answer. In shadow mode `action` is always `"allow"`.
 
 A blocked sign-up gets HTTP 400 with `{ "code": "SIGNUP_BLOCKED", "message": "..." }`. On the client,
-`authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one you set on the Rules
-tab of your signupbouncer dashboard. While you keep the default there, it fits the reason: "Did you mean ann@gmail.com?"
-for a typo domain, for example. When there is no message from the dashboard, such as for an email the plugin refuses
-without asking (over 320 characters, or not an address), it is "Please sign up with a permanent email address." Set
-`blockMessage` to use your own message in code instead.
+`authClient.signUp.email()` returns it as `error`, so show `error.message`. The message is the one SignupBouncer sends
+with the answer (`block_message`), the same for an email sign-up and for one the database hook refuses. It is the
+message you set on the Rules tab of your SignupBouncer dashboard. While you keep the default there, the words fit the
+reason:
+
+- A burner domain: "Please sign up with a permanent email address."
+- A domain that looks like a typo of a big mail provider: "Did you mean ann@gmail.com? Please check your email address
+  and try again."
+- Any other reason, such as a repeat inbox: "We couldn't create your account. Please contact us if you need help."
+
+When the answer has no message, the plugin uses "Please sign up with a permanent email address." That covers an older
+server, a message that is blank, not text or over 500 characters, and an email the plugin refuses without asking (over
+320 characters, or not an address). Set `blockMessage` to use your own message in code. It then wins for every reason.
 
 ## What it does
 
-- Checks every `POST /sign-up/email` before Better Auth creates the user. It sends signupbouncer the email, the
+- Checks every `POST /sign-up/email` before Better Auth creates the user. It sends SignupBouncer the email, the
   User-Agent and, when you configure a source for it, the client IP.
 - Checks the user Better Auth is about to save as well, through a `user.create.before` database hook. When the saved
   address is the one already checked, it makes no second request. When another hook in your app changed the address, it
   checks the new one.
 - Refuses an email longer than 320 characters, or one with spaces or without text on both sides of an `@`, without
-  asking signupbouncer. The API takes at most 320 characters, so a longer address would be cut before the check.
+  asking SignupBouncer. The API takes at most 320 characters, so a longer address would be cut before the check.
 - Refuses the sign-up when the answer's `action` is `"block"`. A `"challenge"` answer is allowed unless you set
   `challenge: "block"`, because Better Auth has no captcha step to send it to.
 - With `checkOtherSignups: true`, also checks users created by OAuth, magic link, email OTP and other plugins (see
@@ -132,7 +140,7 @@ ignored.
 
 ### Which app the checks go to
 
-Each API key belongs to one signupbouncer app, and its checks are logged under that app, so leave `app` out. If you set
+Each API key belongs to one SignupBouncer app, and its checks are logged under that app, so leave `app` out. If you set
 it, it must be the key's own app id (`app_...`). Any other app's id gets HTTP 403 `app_mismatch`, which counts as a
 failed check: every sign-up is allowed and `onError` gets `http_status` 403. To check sign-ups for a second app, create
 a key on that app's Integration tab and use it in that app's config.
@@ -142,7 +150,7 @@ to pick the app, and without it they log the checks under your first app.
 
 ### The client IP
 
-By default the plugin reads no request header and sends no IP, so signupbouncer checks the email alone. A client can
+By default the plugin reads no request header and sends no IP, so SignupBouncer checks the email alone. A client can
 send `CF-Connecting-IP`, `X-Real-IP` or `X-Forwarded-For` itself. Unless something in front of your app overwrites that
 header, a bot can pick any IP it likes, get past the IP checks, or get a stranger's address blocked.
 
@@ -199,7 +207,7 @@ every user created through a request: OAuth callbacks, ID-token sign-in, One Tap
 
 - OAuth and other provider sign-ups (`/callback/:id`, `/sign-in/social`, `/one-tap/`) where the provider marked the
   email verified send the email with `auth_provider`, the provider id such as `"google"`, plus the IP when you
-  configured one. signupbouncer scores these on the IP and signup bursts only, and still counts the email's domain in
+  configured one. SignupBouncer scores these on the IP and signup bursts only, and still counts the email's domain in
   your dashboard.
 - A provider sign-up whose email the provider did not mark verified is checked like an email sign-up, with no
   `auth_provider`.
@@ -235,7 +243,7 @@ Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.0 and 1.7.7 f
 ## Development
 
 ```sh
-deno task test           # unit tests, plus a real in-memory Better Auth instance with the signupbouncer API mocked
+deno task test           # unit tests, plus a real in-memory Better Auth instance with the SignupBouncer API mocked
 deno task check          # fmt, lint, type check
 deno task publish:check  # deno publish --dry-run
 deno task build:npm      # npm package into npm/: npm:deps (deno install, no scripts), then npm:build (dnt)
@@ -243,4 +251,4 @@ deno task build:npm      # npm package into npm/: npm:deps (deno install, no scr
 
 ## Licence
 
-MIT. Copyright (c) 2026 Final Dynamics LLC, which does business as signupbouncer. See [LICENSE](LICENSE).
+MIT. Copyright (c) 2026 Final Dynamics LLC, which does business as SignupBouncer. See [LICENSE](LICENSE).

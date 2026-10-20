@@ -503,3 +503,128 @@ Deno.test("#40 a blocked sign-up shows the dashboard's block_message; blockMessa
     m.restore();
   }
 });
+
+// The block_message /v1/check sends while the app keeps the default message on its Rules tab (signupbouncer
+// api/src/app_rules.ts blockMessageFor, #175 and #176), and answers that carry no usable one.
+const TYPO_MESSAGE = "Did you mean ann@gmail.com? Please check your email address and try again.";
+const REPEAT_MESSAGE = "We couldn't create your account. Please contact us if you need help.";
+const REFUSALS: [string, Record<string, unknown>, string][] = [
+  [
+    "ann@gmial.com",
+    { ...answerBody("block"), suggestion: "ann@gmail.com", block_message: TYPO_MESSAGE },
+    TYPO_MESSAGE,
+  ],
+  [
+    "repeat@example.com",
+    {
+      ...answerBody("block"),
+      reasons: [{ code: "repeat_inbox", detail: "x", points: 80, tier: "free" }],
+      normalized: { provider: null, repeat_signups_7d: 4 },
+      block_message: REPEAT_MESSAGE,
+    },
+    REPEAT_MESSAGE,
+  ],
+  ["challenged@example.com", { ...answerBody("challenge"), block_message: REPEAT_MESSAGE }, REPEAT_MESSAGE],
+  // An older server, or one that sends something that is not a message: the default, and the sign-up is still refused.
+  ["older@example.com", answerBody("block"), DEFAULT_BLOCK_MESSAGE],
+  ["null@example.com", { ...answerBody("block"), block_message: null }, DEFAULT_BLOCK_MESSAGE],
+  ["number@example.com", { ...answerBody("block"), block_message: 42 }, DEFAULT_BLOCK_MESSAGE],
+  ["object@example.com", { ...answerBody("block"), block_message: { text: "x" } }, DEFAULT_BLOCK_MESSAGE],
+  ["blank@example.com", { ...answerBody("block"), block_message: " \n " }, DEFAULT_BLOCK_MESSAGE],
+  ["long@example.com", { ...answerBody("block"), block_message: "x".repeat(501) }, DEFAULT_BLOCK_MESSAGE],
+];
+
+/** Answers each REFUSALS address with its body; any other address is allowed. */
+function mockRefusals() {
+  const bodies = new Map(REFUSALS.map(([email, body]) => [email, body]));
+  return mockApi((email) => bodies.has(email) ? json(bodies.get(email)) : answer("allow"));
+}
+
+Deno.test("#185 both checks show the API's block_message for each reason; blockMessage in code wins for every one", async () => {
+  const m = mockRefusals();
+  try {
+    for (const path of ["endpoint hook", "database hook"]) {
+      for (const [email, , sent] of REFUSALS) {
+        for (
+          const [opts, expected] of [[{}, sent], [{ blockMessage: "No burners, please." }, "No burners, please."]] as [
+            Partial<SignupBouncerOptions>,
+            string,
+          ][]
+        ) {
+          const label = `${path}, ${email}, ${opts.blockMessage === undefined ? "no blockMessage" : "blockMessage"}`;
+          // The database hook makes its own check when an app hook changed the address after the endpoint hook
+          // allowed it, so innocent@example.com (allowed) becomes the refused address only there.
+          const { auth, db } = makeAuth(
+            { ...opts, challenge: "block" },
+            path === "endpoint hook" ? {} : {
+              hooks: {
+                // deno-lint-ignore require-await
+                before: createAuthMiddleware(async (ctx) => {
+                  if (ctx.path !== "/sign-up/email") return;
+                  return { context: { body: { ...(ctx.body as object), email } } };
+                }),
+              },
+            },
+          );
+          const before = m.calls.length;
+          const res = await signUp(auth, path === "endpoint hook" ? email : "innocent@example.com");
+          assertEquals(res.status, 400, label);
+          const body = await res.json();
+          assertEquals([body.code, body.message], ["SIGNUP_BLOCKED", expected], label);
+          assertEquals(db.user.length, 0, label);
+          assertEquals(
+            m.calls.slice(before).map((c) => c.body.email),
+            path === "endpoint hook" ? [email] : ["innocent@example.com", email],
+            label,
+          );
+        }
+      }
+    }
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("#185 the database hook for other sign-ups (magic link, OAuth) throws the API's block_message too", async () => {
+  const run = async (opts: Partial<SignupBouncerOptions>, email: string, ctx: Record<string, unknown>) => {
+    const plugin = signupBouncer({
+      apiKey: "sb_live_test",
+      baseUrl: "https://sb.test",
+      checkOtherSignups: true,
+      ...opts,
+    });
+    // deno-lint-ignore no-explicit-any
+    const before = (await (plugin.init as any)({})).options.databaseHooks.user.create.before;
+    try {
+      await before({ email, emailVerified: true }, ctx);
+    } catch (e) {
+      const err = e as { name?: string; body?: { code?: string; message?: string } };
+      assertEquals(err.name, "APIError");
+      return [err.body?.code, err.body?.message];
+    }
+    return ["allowed"];
+  };
+  const m = mockRefusals();
+  try {
+    const headers = new Headers();
+    for (
+      const ctx of [{ path: "/magic-link/verify", headers }, {
+        path: "/callback/:id",
+        params: { id: "google" },
+        headers,
+      }]
+    ) {
+      for (const [email, , sent] of REFUSALS) {
+        const label = `${ctx.path}, ${email}`;
+        assertEquals(await run({ challenge: "block" }, email, ctx), ["SIGNUP_BLOCKED", sent], label);
+        assertEquals(
+          await run({ challenge: "block", blockMessage: "No burners, please." }, email, ctx),
+          ["SIGNUP_BLOCKED", "No burners, please."],
+          label,
+        );
+      }
+    }
+  } finally {
+    m.restore();
+  }
+});
