@@ -85,6 +85,7 @@ await build({
   postBuild() {
     Deno.copyFileSync("LICENSE", "npm/LICENSE");
     Deno.copyFileSync("README.md", "npm/README.md");
+    Deno.copyFileSync("CHANGELOG.md", "npm/CHANGELOG.md");
     Deno.writeTextFileSync("npm/.npmignore", Deno.readTextFileSync("npm/.npmignore") + "deno.lock\n");
   },
 });

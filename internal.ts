@@ -157,16 +157,85 @@ export type HookCtx =
   | null
   | undefined;
 
+/** The provider ids the generic-OAuth plugin registers, from the `plugins` in the app's Better Auth options. */
+function genericOAuthIds(options: unknown): Set<string> {
+  const ids = new Set<string>();
+  const plugins = (options as { plugins?: unknown } | null | undefined)?.plugins;
+  if (!Array.isArray(plugins)) return ids;
+  for (const plugin of plugins) {
+    const p = plugin as { id?: unknown; options?: { config?: unknown } } | null;
+    if (!p || p.id !== "generic-oauth" || !Array.isArray(p.options?.config)) continue;
+    for (const c of p.options.config) {
+      const id = (c as { providerId?: unknown } | null)?.providerId;
+      if (typeof id === "string") ids.add(id);
+    }
+  }
+  return ids;
+}
+
 /**
- * The provider id for a provider-verified sign-up, sent as `auth_provider`. Better Auth gives the route pattern in
- * `ctx.path` (`/callback/:id`) and the provider in `ctx.params`: `id` for social and generic OAuth callbacks,
- * `providerId` for SSO. One Tap is `"google"`; ID-token sign-in on `/sign-in/social` names it in the body. Anything
- * missing or malformed is `"oauth"`.
+ * The social provider ids whose sign-ups may be sent with `auth_provider` and `email_verified`: the app's own
+ * `socialProviders` (Better Auth's built-in OAuth providers, which take `emailVerified` from the provider's own flag)
+ * that Better Auth enabled at start-up, minus every generic-OAuth provider id.
+ *
+ * Read from the context Better Auth passes to the plugin's `init`. By then Better Auth has called each function-valued
+ * `socialProviders` entry and left out the ones with `enabled: false` or no config, and `ctx.socialProviders` holds the
+ * resulting providers. The plugin reads their ids and never calls a config function itself, so a factory that fails or
+ * hangs on a second call cannot change which providers are trusted or stall start-up.
+ *
+ * An id counts only when it is also a key of `options.socialProviders`, so a provider another plugin adds is not
+ * trusted. A generic-OAuth provider may reuse a built-in id ("google") and then handles that id's sign-ins in place of
+ * the built-in one, whatever the plugin order, so a generic id, or an id that appears twice, is never trusted.
  */
-export function providerFor(ctx: HookCtx): string {
-  const path = ctx?.path ?? "";
-  let id: unknown = ctx?.params?.id ?? ctx?.params?.providerId;
-  if (id === undefined && /^\/one-tap\//.test(path)) id = "google";
-  if (id === undefined && path === "/sign-in/social") id = (ctx?.body as { provider?: unknown } | undefined)?.provider;
-  return typeof id === "string" && PROVIDER_ID.test(id) ? id : "oauth";
+export function configuredSocialProviders(authCtx: unknown): Set<string> {
+  const ctx = authCtx as { socialProviders?: unknown; options?: unknown } | null | undefined;
+  const ids = new Set<string>();
+  const resolved = ctx?.socialProviders;
+  const configured = (ctx?.options as { socialProviders?: unknown } | null | undefined)?.socialProviders;
+  if (!Array.isArray(resolved) || !configured || typeof configured !== "object") return ids;
+  const generic = genericOAuthIds(ctx?.options);
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const provider of resolved) {
+    // An entry that is not a provider object (Better Auth's own lookups allow a function here) is never called.
+    const id = provider && typeof provider === "object" ? (provider as { id?: unknown }).id : undefined;
+    if (typeof id !== "string") continue;
+    if (seen.has(id)) repeated.add(id);
+    seen.add(id);
+  }
+  for (const id of seen) {
+    if (Object.hasOwn(configured, id) && !generic.has(id) && !repeated.has(id)) ids.add(id);
+  }
+  return ids;
+}
+
+/**
+ * The provider id to send as `auth_provider` for a user created by this request, or `undefined`. Only Better Auth's
+ * core social sign-in routes, and only for a provider in `trusted` (see {@link configuredSocialProviders}): the OAuth
+ * callback `/callback/:id` (the id is in `ctx.params`), ID-token sign-in on `/sign-in/social` (the id is the body's
+ * `provider`) and `/one-tap/callback` (Google). Never an id from an SSO route (`/sso/...`) or a generic-OAuth provider:
+ * those ids are named by the app or, with self-service SSO, by its users, who could pick a name SignupBouncer trusts
+ * and hand it any address. Without a provider, the email is checked like an email sign-up.
+ */
+export function socialProviderFor(ctx: HookCtx, trusted: ReadonlySet<string>): string | undefined {
+  const path = ctx?.path;
+  let id: unknown;
+  if (path === "/callback/:id") id = ctx?.params?.id;
+  else if (path === "/one-tap/callback") id = "google";
+  else if (path === "/sign-in/social") id = (ctx?.body as { provider?: unknown } | undefined)?.provider;
+  return typeof id === "string" && PROVIDER_ID.test(id) && trusted.has(id) ? id : undefined;
+}
+
+/**
+ * `u` when it is a well-formed http(s) URL with a host, at most 2,048 characters, unchanged; otherwise `undefined`.
+ * The same check as SignupBouncer's other helpers, so a bad `why_url` never becomes a link.
+ */
+export function validWhyUrl(u: unknown): string | undefined {
+  if (typeof u !== "string" || u.length > 2048 || !/^https?:\/\/[^\s/\\?#][^\s\\]*$/i.test(u)) return undefined;
+  try {
+    const url = new URL(u);
+    return (url.protocol === "https:" || url.protocol === "http:") && url.hostname !== "" ? u : undefined;
+  } catch {
+    return undefined;
+  }
 }

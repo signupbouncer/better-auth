@@ -13,7 +13,7 @@ import {
   signupBouncer,
   type SignupBouncerOptions,
 } from "../mod.ts";
-import { providerFor } from "../internal.ts";
+import { configuredSocialProviders, socialProviderFor } from "../internal.ts";
 import { answer, answerBody, type Call, hang, json, mockFetch } from "./mock_fetch.ts";
 
 const BASE = "http://localhost:3000";
@@ -239,7 +239,13 @@ Deno.test("checkOtherSignups: a real magic-link sign-up is checked and blocked; 
   }
 });
 
-Deno.test("database hook: blocks other paths; verified OAuth sends the provider from ctx.params", async () => {
+// What Better Auth passes to a plugin's init: the resolved providers and its options, here Google and GitHub.
+const SOCIAL = {
+  socialProviders: [{ id: "google" }, { id: "github" }],
+  options: { socialProviders: { google: { clientId: "g" }, github: { clientId: "gh" } } },
+};
+
+Deno.test("database hook: blocks other paths; a social OAuth sign-up sends the provider and email_verified", async () => {
   const plugin = signupBouncer({
     apiKey: "sb_live_test",
     baseUrl: "https://sb.test",
@@ -247,7 +253,7 @@ Deno.test("database hook: blocks other paths; verified OAuth sends the provider 
     ipHeader: "x-forwarded-for",
   });
   // deno-lint-ignore no-explicit-any
-  const init = await (plugin.init as any)({});
+  const init = await (plugin.init as any)(SOCIAL);
   const before = init.options.databaseHooks.user.create.before as (
     user: { email: string; emailVerified?: boolean },
     ctx?: { path?: string; params?: Record<string, string>; headers?: Headers },
@@ -275,10 +281,15 @@ Deno.test("database hook: blocks other paths; verified OAuth sends the provider 
       threw = true;
     }
     assert(threw, "oauth signup from a blocked IP should be blocked");
-    assertEquals(m.calls[1].body, { email: "x@gmail.com", ip: "203.0.113.50", auth_provider: "google" });
+    assertEquals(m.calls[1].body, {
+      email: "x@gmail.com",
+      ip: "203.0.113.50",
+      auth_provider: "google",
+      email_verified: true,
+    });
 
-    // An unverified OAuth email is checked as an email, with no auth_provider (P1-2).
-    await before({ email: "y@mailinator.com", emailVerified: false }, {
+    // A provider that is not one of the app's socialProviders is checked as an email, with no auth_provider (P1-2).
+    await before({ email: "y@mailinator.com", emailVerified: true }, {
       path: "/callback/:id",
       params: { id: "acme" },
       headers,
@@ -291,40 +302,113 @@ Deno.test("database hook: blocks other paths; verified OAuth sends the provider 
     await before({ email: "x@mailinator.com" }, { path: "/sign-in/anonymous", headers });
     assertEquals(m.calls.length, 3);
 
-    // Without an IP source a verified OAuth sign-up is still sent (email + provider).
+    // Without an IP source a social OAuth sign-up is still sent (email + provider + flag). An unverified one says so.
     const noIp = signupBouncer({ apiKey: "sb_live_test", baseUrl: "https://sb.test", checkOtherSignups: true });
     // deno-lint-ignore no-explicit-any
-    const noIpBefore = (await (noIp.init as any)({})).options.databaseHooks.user.create.before;
-    await noIpBefore({ email: "x@gmail.com", emailVerified: true }, {
-      path: "/callback/:id",
-      params: { id: "github" },
-      headers,
-    }).catch(() => {});
-    assertEquals(m.calls[3].body, { email: "x@gmail.com", auth_provider: "github" });
+    const noIpBefore = (await (noIp.init as any)(SOCIAL)).options.databaseHooks.user.create.before;
+    for (const emailVerified of [true, false, undefined, "true"]) {
+      await noIpBefore({ email: "x@gmail.com", emailVerified }, {
+        path: "/callback/:id",
+        params: { id: "github" },
+        headers,
+      }).catch(() => {});
+    }
+    assertEquals(m.calls.slice(3).map((c) => c.body), [
+      { email: "x@gmail.com", auth_provider: "github", email_verified: true },
+      { email: "x@gmail.com", auth_provider: "github", email_verified: false },
+      { email: "x@gmail.com", auth_provider: "github", email_verified: false },
+      { email: "x@gmail.com", auth_provider: "github", email_verified: false },
+    ]);
   } finally {
     m.restore();
   }
 });
 
-Deno.test("providerFor: params id or providerId, One Tap, ID-token sign-in, fallback", () => {
-  assertEquals(providerFor({ path: "/callback/:id", params: { id: "google" } }), "google");
-  assertEquals(providerFor({ path: "/sso/callback/:providerId", params: { providerId: "okta" } }), "okta");
-  assertEquals(providerFor({ path: "/one-tap/callback" }), "google");
-  assertEquals(providerFor({ path: "/sign-in/social", body: { provider: "apple" } }), "apple");
-  assertEquals(providerFor({ path: "/sign-in/social", body: { provider: "<script>" } }), "oauth");
-  assertEquals(providerFor({ path: "/callback/:id", params: { id: ":id" } }), "oauth");
-  assertEquals(providerFor({ path: "/callback/:id" }), "oauth");
+Deno.test("socialProviderFor: only Better Auth's social routes, only for a trusted provider", () => {
+  const trusted = new Set(["google", "apple", "github"]);
+  assertEquals(socialProviderFor({ path: "/callback/:id", params: { id: "google" } }, trusted), "google");
+  assertEquals(socialProviderFor({ path: "/one-tap/callback" }, trusted), "google");
+  assertEquals(socialProviderFor({ path: "/sign-in/social", body: { provider: "apple" } }, trusted), "apple");
+  // Not trusted: an id outside the app's socialProviders, an SSO or generic-OAuth route, a malformed or missing id.
+  assertEquals(socialProviderFor({ path: "/callback/:id", params: { id: "acme" } }, trusted), undefined);
+  assertEquals(socialProviderFor({ path: "/one-tap/callback" }, new Set(["github"])), undefined);
+  assertEquals(
+    socialProviderFor({ path: "/sso/callback/:providerId", params: { providerId: "google" } }, trusted),
+    undefined,
+  );
+  assertEquals(
+    socialProviderFor({ path: "/oauth2/callback/:providerId", params: { providerId: "google" } }, trusted),
+    undefined,
+  );
+  assertEquals(socialProviderFor({ path: "/sign-in/social", body: { provider: "<script>" } }, trusted), undefined);
+  assertEquals(socialProviderFor({ path: "/callback/:id", params: { id: ":id" } }, trusted), undefined);
+  assertEquals(socialProviderFor({ path: "/callback/:id" }, trusted), undefined);
+  assertEquals(socialProviderFor({ path: "/magic-link/verify" }, trusted), undefined);
+  assertEquals(socialProviderFor(undefined, trusted), undefined);
 });
 
-Deno.test("checkSignup sends auth_provider only when given", async () => {
+Deno.test("configuredSocialProviders: providers Better Auth enabled, minus generic-OAuth, repeated or added ids", () => {
+  const generic = { id: "generic-oauth", options: { config: [{ providerId: "github" }, { providerId: "acme" }] } };
+  let called = 0;
+  const factory = () => {
+    called++;
+    return Promise.resolve({ clientId: "a" });
+  };
+  const ids = configuredSocialProviders({
+    // What Better Auth resolved before plugin init: disabled discord is not there; generic-OAuth's init may have
+    // added its own providers (acme, and a github that shadows the built-in one).
+    socialProviders: [
+      { id: "acme" },
+      { id: "github" },
+      { id: "google" },
+      { id: "apple" },
+      { id: "github" },
+      { id: "twitch" }, // added by some other plugin, not in options.socialProviders
+      () => ({ id: "x" }),
+      null,
+    ],
+    options: {
+      socialProviders: {
+        google: { clientId: "g" },
+        apple: factory, // function-valued: already resolved by Better Auth, never called again here
+        github: { clientId: "gh" },
+        discord: { clientId: "d", enabled: false },
+      },
+      plugins: [{ id: "magic-link" }, generic],
+    },
+  });
+  assertEquals([...ids].sort(), ["apple", "google"]);
+  assertEquals(called, 0);
+  // A provider repeated by a plugin other than generic-OAuth is not trusted either.
+  assertEquals(
+    [...configuredSocialProviders({
+      socialProviders: [{ id: "google" }, { id: "google" }],
+      options: { socialProviders: { google: {} } },
+    })],
+    [],
+  );
+  assertEquals(configuredSocialProviders(undefined).size, 0);
+  assertEquals(configuredSocialProviders({ options: { socialProviders: { google: {} } } }).size, 0);
+  assertEquals(configuredSocialProviders({ socialProviders: [{ id: "google" }] }).size, 0);
+});
+
+Deno.test("checkSignup sends auth_provider and email_verified only when given", async () => {
   const m = mockApi(() => answer("allow"));
   try {
-    await checkSignup({ apiKey: "sb_live_test", baseUrl: "https://sb.test" }, { email: "a@b.com" });
-    await checkSignup({ apiKey: "sb_live_test", baseUrl: "https://sb.test" }, {
-      email: "a@b.com",
-      authProvider: "github",
-    });
-    assertEquals(m.calls.map((c) => c.body), [{ email: "a@b.com" }, { email: "a@b.com", auth_provider: "github" }]);
+    const opts = { apiKey: "sb_live_test", baseUrl: "https://sb.test" };
+    await checkSignup(opts, { email: "a@b.com" });
+    await checkSignup(opts, { email: "a@b.com", authProvider: "github" });
+    await checkSignup(opts, { email: "a@b.com", authProvider: "github", emailVerified: true });
+    await checkSignup(opts, { email: "a@b.com", authProvider: "github", emailVerified: false });
+    // A value that is not a boolean is left out, never sent as something the API would refuse.
+    await checkSignup(opts, { email: "a@b.com", authProvider: "github", emailVerified: "true" as unknown as boolean });
+    assertEquals(m.calls.map((c) => c.body), [
+      { email: "a@b.com" },
+      { email: "a@b.com", auth_provider: "github" },
+      { email: "a@b.com", auth_provider: "github", email_verified: true },
+      { email: "a@b.com", auth_provider: "github", email_verified: false },
+      { email: "a@b.com", auth_provider: "github" },
+    ]);
   } finally {
     m.restore();
   }
@@ -462,11 +546,12 @@ async function oauthSignUp(emailVerified: boolean, email: string) {
   return { db, location: callback.headers.get("location") ?? "" };
 }
 
-Deno.test("P1-2 + P2-5 real OAuth callback: verified email sends the real provider id, unverified is checked as email", async () => {
+Deno.test("P1-2 real generic-OAuth callback: checked as an email sign-up, verified or not", async () => {
   const m = mockApi((email) => answer(email.endsWith("@mailinator.com") ? "block" : "allow"));
   try {
+    // A generic-OAuth provider's id is the app's own choice, so it is never sent as auth_provider.
     const verified = await oauthSignUp(true, "person@example.com");
-    assertEquals(m.calls.map((c) => c.body), [{ email: "person@example.com", auth_provider: "acme" }]);
+    assertEquals(m.calls.map((c) => c.body), [{ email: "person@example.com" }]);
     assertEquals(verified.db.user.length, 1);
     assert(verified.location.startsWith(`${BASE}/done`), verified.location);
 
