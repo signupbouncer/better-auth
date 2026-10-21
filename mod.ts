@@ -1,9 +1,11 @@
 /**
- * signupbouncer plugin for Better Auth. It checks each new email sign-up with signupbouncer's `/v1/check` API and
- * refuses the ones signupbouncer says to block. If signupbouncer is slow, down or sends anything unexpected (including
+ * SignupBouncer plugin for Better Auth. It checks each new email sign-up with SignupBouncer's `/v1/check` API and
+ * refuses the ones SignupBouncer says to block. If SignupBouncer is slow, down or sends anything unexpected (including
  * an answer missing a field the API always sends), the sign-up goes through (fail open). A refused sign-up gets HTTP
  * 400 with `{ code: "SIGNUP_BLOCKED", message }`, plus `why_url` when you turn on the "Why was this refused?" link on
  * the Rules tab of your dashboard.
+ *
+ * Setup guide: https://signupbouncer.com/better-auth. API docs: https://signupbouncer.com/docs.
  *
  * ```ts
  * import { betterAuth } from "better-auth";
@@ -39,7 +41,7 @@ import {
   validWhyUrl,
 } from "./internal.ts";
 
-/** What signupbouncer says to do with a sign-up. In shadow mode this is always `"allow"`. */
+/** What SignupBouncer says to do with a sign-up. In shadow mode this is always `"allow"`. */
 export type SignupAction = "allow" | "challenge" | "block";
 
 /** Why a check could not be completed. The sign-up is allowed in every case. */
@@ -69,7 +71,7 @@ export interface CheckResponse {
   verdict: SignupAction;
   /** What to do: the same as `verdict` in enforce mode, always `"allow"` in shadow mode. */
   action: SignupAction;
-  /** The app's mode in your signupbouncer dashboard. */
+  /** The app's mode in your SignupBouncer dashboard. */
   mode: "shadow" | "enforce";
   /** Risk score; 70 and up blocks with the default thresholds. */
   score: number;
@@ -83,7 +85,7 @@ export interface CheckResponse {
   normalized: { provider: string | null; repeat_signups_7d: number };
   /** The IP's network, or `null` when no usable IP was sent. */
   network: { asn: number | null; asn_org: string | null; kinds: string[]; label: string | null; prefix: string } | null;
-  /** Time the check took on signupbouncer's side, in milliseconds. */
+  /** Time the check took on SignupBouncer's side, in milliseconds. */
   latency_ms: number;
   /** True when the check was skipped because the account is over its monthly limit. The action is then allow. */
   quota_exceeded: boolean;
@@ -104,7 +106,7 @@ export interface CheckResponse {
 
 /**
  * Result of one check. `action` is always set:
- * - `ok: true`: signupbouncer answered, and `action` is its answer.
+ * - `ok: true`: SignupBouncer answered, and `action` is its answer.
  * - `ok: false` with `action: "allow"`: the check failed and the sign-up is allowed (fail open).
  * - `ok: false` with `action: "block"`: the email is longer than 320 characters or is not an address. The API would cut
  *   or reject it, so the plugin refuses it without a request.
@@ -116,7 +118,7 @@ export type CheckResult =
 
 /** Options for {@linkcode signupBouncer}. Only `apiKey` is required. */
 export interface SignupBouncerOptions {
-  /** Your signupbouncer API key (`sb_live_...`). Without one, every sign-up is allowed and `onError` is called. */
+  /** Your SignupBouncer API key (`sb_live_...`). Without one, every sign-up is allowed and `onError` is called. */
   apiKey: string;
   /** API origin. Default `https://signupbouncer.com`. */
   baseUrl?: string;
@@ -128,13 +130,13 @@ export interface SignupBouncerOptions {
    */
   app?: string;
   /**
-   * How long to wait for signupbouncer before allowing the sign-up, in milliseconds. Default 1,500. A value that is
+   * How long to wait for SignupBouncer before allowing the sign-up, in milliseconds. Default 1,500. A value that is
    * not a positive number uses the default, and anything above 10,000 is cut to 10,000.
    */
   timeoutMs?: number;
   /**
    * Message returned to the client when a sign-up is blocked. Set here, it wins over the dashboard. Leave it out to use
-   * the one signupbouncer sends, which you set on the Rules tab of your dashboard, or {@linkcode DEFAULT_BLOCK_MESSAGE}
+   * the one SignupBouncer sends, which you set on the Rules tab of your dashboard, or {@linkcode DEFAULT_BLOCK_MESSAGE}
    * when there is none, such as for an email the plugin refuses without a request (see {@linkcode blockMessage}).
    */
   blockMessage?: string;
@@ -170,7 +172,7 @@ export interface SignupBouncerOptions {
    * Also check users created outside `/sign-up/email` (OAuth callbacks, magic link, email OTP and other plugins),
    * through a `user.create.before` database hook. A sign-up through one of your `socialProviders` (Google, GitHub and
    * the other providers built into Better Auth) is sent with `auth_provider` (the provider id, such as `"google"`) and
-   * `email_verified`, Better Auth's own flag that the provider verified the address. When that is `true`, signupbouncer
+   * `email_verified`, Better Auth's own flag that the provider verified the address. When that is `true`, SignupBouncer
    * scores the sign-up on IP and signup bursts only and counts the email's domain in your dashboard; when it is
    * `false`, the email is checked too. Every other sign-up, SSO and generic OAuth included, has its email checked like
    * an email sign-up. Default `false`.
@@ -251,7 +253,7 @@ export async function checkSignup(
     /**
      * With `authProvider`: your auth library's own flag that the provider verified `email` (Better Auth's
      * `user.emailVerified` from the OAuth profile), never something the user typed. Only when it is `true` and
-     * signupbouncer knows the provider does it score just the IP and signup bursts, keeping the email's domain for your
+     * SignupBouncer knows the provider does it score just the IP and signup bursts, keeping the email's domain for your
      * stats; missing or `false`, the email is checked too.
      */
     emailVerified?: boolean;
@@ -353,7 +355,7 @@ export function shouldBlock(result: CheckResult, challenge: "allow" | "block" = 
 }
 
 /**
- * The message to show a refused sign-up: the `block_message` signupbouncer sent with the answer (set on the Rules tab
+ * The message to show a refused sign-up: the `block_message` SignupBouncer sent with the answer (set on the Rules tab
  * of your dashboard), or {@linkcode DEFAULT_BLOCK_MESSAGE} when there is none, such as for an email refused locally.
  *
  * @param result A result from {@linkcode checkSignup}.
@@ -364,7 +366,7 @@ export function blockMessage(result: CheckResult): string {
 
 /**
  * The "Why was this refused?" link to show after {@linkcode blockMessage}: SignupBouncer's page about the email's
- * domain. signupbouncer sends it with a block or challenge answer only when you turn the link on in the Rules tab of
+ * domain. SignupBouncer sends it with a block or challenge answer only when you turn the link on in the Rules tab of
  * your dashboard. Otherwise, for a failed check and for an email refused locally, it is `null`. Only a well-formed
  * http(s) URL with a host counts, returned unchanged.
  *
@@ -476,7 +478,7 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
                   }
                   if (!options.checkOtherSignups) return;
                   // One of the app's own social providers: send its id with Better Auth's emailVerified from the
-                  // provider, so signupbouncer can score only the IP and signup bursts when the provider verified the
+                  // provider, so SignupBouncer can score only the IP and signup bursts when the provider verified the
                   // address, and still count the email's domain. Anything else, SSO and generic OAuth included, has its
                   // email checked.
                   const authProvider = socialProviderFor(ctx, social);
