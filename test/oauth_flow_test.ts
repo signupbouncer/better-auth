@@ -220,6 +220,20 @@ Deno.test("#210 without checkOtherSignups, OAuth sign-ups are not checked at all
   }
 });
 
+Deno.test("0.2.1 a Google sign-up with a quoted address is checked, not refused without a check", async () => {
+  // 0.2.0 refused any address with a space before asking SignupBouncer, so this user got SIGNUP_BLOCKED.
+  const quoted = '"first last"@company.co.uk';
+  const net = mockNetwork();
+  try {
+    const r = await redirectSignup({ google: googleConfig(quoted, false) }, [bouncer()]);
+    assertEquals(net.checks, [{ email: quoted, auth_provider: "google", email_verified: false }]);
+    assert(r.location.startsWith("/done"), r.location);
+    assertEquals(r.users.map((u) => u.email), [quoted]);
+  } finally {
+    net.restore();
+  }
+});
+
 Deno.test("#210 why_url: the OAuth redirect carries code and message only; ID-token sign-in returns the link", async () => {
   const why = "https://signupbouncer.com/why/mailinator.com";
   const net = mockNetwork({ block_message: "Use your work email.", why_url: why });

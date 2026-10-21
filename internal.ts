@@ -9,16 +9,27 @@ export const MAX_RESPONSE_BYTES = 64 * 1024;
 const ACTIONS = new Set<string>(["allow", "challenge", "block"]);
 
 /**
- * True for an address the API checks as sent: at most 320 characters, an `@` with text on both sides, and no
- * whitespace or control characters. Anything else is refused locally, because the API would cut or reject it and the
- * plugin would then check an address other than the one Better Auth saves.
+ * True for an address the API checks as sent. Refused locally, because the API would cut, trim or split it differently
+ * and the plugin would then check an address other than the one Better Auth saves: more than 320 characters, leading or
+ * trailing whitespace (the API trims it), control characters, no text on one side of the last `@`, whitespace in the
+ * domain, and whitespace in a local part that is not quoted. These follow the API's own parser (core/email.ts in the
+ * SignupBouncer repo), which accepts a quoted local part with spaces, such as `"first last"@company.co.uk`. Every other
+ * address is sent, and the API decides; it scores an address it cannot parse instead of rejecting the request.
  */
 export function isCheckableEmail(email: string): boolean {
   if (email.length < 3 || email.length > MAX_EMAIL_LENGTH) return false;
+  if (email.trim() !== email) return false;
   // deno-lint-ignore no-control-regex
-  if (/[\s\x00-\x1f\x7f]/.test(email)) return false;
+  if (/[\x00-\x1f\x7f]/.test(email)) return false;
+  // As in the API, the last "@" splits the address, because a quoted local part can hold one ("a@b"@x.com).
   const at = email.lastIndexOf("@");
-  return at > 0 && at < email.length - 1;
+  if (at <= 0 || at >= email.length - 1) return false;
+  if (/\s/.test(email.slice(at + 1))) return false;
+  // Only a quoted local part may hold whitespace. 0.2.0 and earlier refused every space, so `"first last"@x.com`
+  // was refused without a check.
+  const local = email.slice(0, at);
+  const quoted = local.length >= 2 && local.startsWith('"') && local.endsWith('"');
+  return quoted || !/\s/.test(local);
 }
 
 /** Returns `raw` as a bare IP address (ports and IPv6 brackets removed), or `undefined` if it does not look like one. */
