@@ -2,10 +2,22 @@
 
 ## 0.2.1
 
-The npm listing names SignupBouncer as the author and links to https://signupbouncer.com. No code change.
+A user whose address has a quoted part with a space, such as `"first last"@company.co.uk`, is no longer refused before
+SignupBouncer is asked. Releases now reach npm without a stored npm token. The npm listing names SignupBouncer and links
+to https://signupbouncer.com.
 
+- **Quoted addresses are checked.** 0.2.0 refused any address with a space without a request, so an OAuth user with a
+  quoted address (with `checkOtherSignups: true`) got `SIGNUP_BLOCKED`. The plugin now refuses only what SignupBouncer
+  would trim, cut or read differently: more than 320 characters, whitespace at either end, control characters, no text
+  on one side of the last `@`, or whitespace in the domain or in an unquoted local part. Everything else is sent and
+  checked. On `/sign-up/email`, Better Auth still refuses a quoted address as an invalid email, after the check.
+- **Setup guide links.** The README and the module doc JSR shows link https://signupbouncer.com/better-auth.
+- **SignupBouncer** with both capitals in the doc comments JSR shows.
 - npm `author` is now `SignupBouncer` (was `Final Dynamics LLC`; the licence still names the company that holds the
   copyright) and `homepage` is the home page (was `/docs`).
+- **Release workflow** (signupbouncer/better-auth#3): the npm job publishes with npm trusted publishing (GitHub OIDC)
+  and holds no npm token. It receives one packed tarball from the build job and runs npm in a folder holding only that
+  file, so nothing the build writes can become npm configuration.
 
 ## 0.2.0
 
