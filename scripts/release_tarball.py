@@ -8,9 +8,10 @@ proxy and TLS settings included), so publishConfig must be exactly what scripts/
 
     python3 -I release_tarball.py <in.tgz> <out.tgz> <package name> <version>
 
-Refused: anything but regular files and directories (links, devices), a path outside `package/` or with an empty,
-`.` or `..` part or a backslash, the same path twice, any .npmrc, a "[FILL" placeholder, and a package.json whose
-name, version or publishConfig differ from the expected ones.
+Refused: anything but regular files and directories (links, devices), a path outside `package/`, a path part with
+any character other than letters, digits and . _ @ + - (so no colon, backslash, space or control character), an
+empty, `.` or `..` part, the same path twice, any .npmrc, a "[FILL" placeholder, and a package.json whose name,
+version or publishConfig differ from the expected ones.
 """
 
 import io
@@ -22,7 +23,10 @@ import tarfile
 EXPECTED_PUBLISH_CONFIG = {"access": "public", "provenance": True}
 # npm pack's fixed timestamp (1985-10-26), so the clean copy is as reproducible as the original.
 MTIME = 499162500
-SAFE_PATH = re.compile(r"^package(/[^/\\\x00-\x1f\x7f]+)+$")
+# An allowlist, not a blocklist: npm's tar reader rewrites some paths (it strips a Windows drive prefix such as "z:"
+# even on Linux, and absolute roots), so a path it would read as another file must never pass. Every part after
+# "package/" may hold only letters, digits and . _ @ + -, and none may be "." or "..".
+SAFE_PART = re.compile(r"^[A-Za-z0-9._@+-]+$")
 
 
 def fail(message: str) -> None:
@@ -31,7 +35,12 @@ def fail(message: str) -> None:
 
 
 def safe_path(name: str) -> bool:
-    return SAFE_PATH.match(name) is not None and not any(p in (".", "..") for p in name.split("/"))
+    parts = name.split("/")
+    return (
+        len(parts) >= 2
+        and parts[0] == "package"
+        and all(SAFE_PART.fullmatch(p) is not None and p not in (".", "..") for p in parts[1:])
+    )
 
 
 def main() -> None:

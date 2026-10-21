@@ -54,6 +54,8 @@ jobs:
             const p = m.signupBouncer({ apiKey: "sb_live_ci" });
             if (p.id !== "signupbouncer" || typeof p.hooks.before[0].handler !== "function") process.exit(1);
             console.log(process.version, "exports:", Object.keys(m).sort().join(" "));
+      - name: Release tarball checker tests
+        run: python3 -I scripts/release_tarball_test.py
       # The same tarball check the publish workflow's npm job runs, so a build change that would stop a release (a new
       # publishConfig key, say) fails here first. npm pack also lists the files npm would publish.
       - name: Pack the npm package and run the release tarball check
