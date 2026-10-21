@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.1
+
+The npm listing names SignupBouncer as the author and links to https://signupbouncer.com. No code change.
+
+- npm `author` is now `SignupBouncer` (was `Final Dynamics LLC`; the licence still names the company that holds the
+  copyright) and `homepage` is the home page (was `/docs`).
+
+## 0.2.0
 
 A Google, GitHub or other built-in OAuth sign-up whose address the provider verified is no longer refused by an email
 rule: the plugin now tells SignupBouncer the provider verified it. A refused sign-up can also carry the "Why was this
