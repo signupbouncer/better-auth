@@ -7,7 +7,8 @@ most 1.5 seconds on the check.
 
 You need a SignupBouncer API key. Create an account at https://signupbouncer.com/signup, then choose "Create API key" on
 your app's Integration tab in the dashboard and copy the key (`sb_live_...`). Each key belongs to one app, and the
-checks it makes are logged under that app. The full API docs are at https://signupbouncer.com/docs.
+checks it makes are logged under that app. The setup guide for Better Auth is at https://signupbouncer.com/better-auth,
+and the full API docs are at https://signupbouncer.com/docs.
 
 ## Install
 
@@ -116,8 +117,11 @@ way. It never shows your settings or your checks, and the link carries the domai
 - Checks the user Better Auth is about to save as well, through a `user.create.before` database hook. When the saved
   address is the one already checked, it makes no second request. When another hook in your app changed the address, it
   checks the new one.
-- Refuses an email longer than 320 characters, or one with spaces or without text on both sides of an `@`, without
-  asking SignupBouncer. The API takes at most 320 characters, so a longer address would be cut before the check.
+- Refuses some emails without asking SignupBouncer, because the API would check a different address than the one Better
+  Auth saves: one longer than 320 characters (the API would cut it), one with spaces or other whitespace at either end
+  (the API would trim them), control characters, no text on one side of the last `@`, or a space outside quotes. A
+  quoted address such as `"first last"@company.co.uk` is checked like any other. On `/sign-up/email`, Better Auth then
+  refuses it as an invalid email; OAuth and other sign-ups can save one.
 - Refuses the sign-up when the answer's `action` is `"block"`. A `"challenge"` answer is allowed unless you set
   `challenge: "block"`, because Better Auth has no captcha step to send it to.
 - With `checkOtherSignups: true`, also checks users created by OAuth, magic link, email OTP and other plugins (see

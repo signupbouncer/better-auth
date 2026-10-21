@@ -472,6 +472,68 @@ Deno.test("P1-1 an overlong or malformed email is blocked locally, never sent, n
   }
 });
 
+Deno.test("0.2.1 quoted local parts the API accepts are sent, spaces included", async () => {
+  // The valid quoted addresses from the API's own test (core/email_test.ts "parseEmail: quoted local parts" in the
+  // SignupBouncer repo), plus ordinary ones. Every one must reach the API unchanged.
+  const apiValid = [
+    '"john.smith"@gmail.com',
+    '"John.Smith+x"@GoogleMail.com',
+    '"first last"@company.co.uk',
+    '"a@b"@company.co.uk',
+    '"a\\"b"@company.co.uk',
+    '"a\\\\b"@company.co.uk',
+    '"a..b"@company.co.uk',
+    '"José Ñ"@company.co.uk',
+    '"First Last+x"@gmail.com',
+    '"a b-c"@yahoo.com',
+    '"a b"@company.co.uk', // a no-break space inside quotes
+    "ann+tag@gmail.com",
+    "josé@exämple.com",
+  ];
+  const m = mockFetch(() => answer("allow"));
+  try {
+    for (const email of apiValid) {
+      const r = await checkSignup(opts, { email });
+      assertEquals([r.ok, r.action], [true, "allow"], email);
+    }
+    assertEquals(m.calls.map((c) => c.body.email), apiValid);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("0.2.1 refused locally: only what the API would trim, cut or split differently", async () => {
+  const refused = [
+    " a@b.com", // leading whitespace: the API trims it
+    "a@b.com ", // trailing whitespace
+    " a@b.com", // Unicode whitespace is trimmed too
+    "a\tb@b.com", // control character
+    '"a\u0001b"@company.co.uk', // control character inside quotes
+    "a b@example.com", // a space in an unquoted local part
+    "a b@example.com", // a no-break space in an unquoted local part
+    '"ab c@example.com', // unterminated quote, so not quoted: the space counts
+    'ab c"@example.com',
+    '" @example.com', // a lone quote is not a quoted local part
+    "a@exa mple.com", // whitespace in the domain
+    'a@"x y".com',
+    '"a b"@',
+    "a@",
+    "@b.com",
+  ];
+  const m = mockFetch(() => answer("allow"));
+  try {
+    for (const email of refused) {
+      const errors: CheckError[] = [];
+      const r = await checkSignup({ ...opts, onError: (e) => errors.push(e) }, { email });
+      assertEquals(r, { ok: false, action: "block", error: { reason: "invalid_email" } }, JSON.stringify(email));
+      assertEquals(errors, [], JSON.stringify(email));
+    }
+    assertEquals(m.calls.length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
 Deno.test("no email and no IP: no request, onError gets no_input", async () => {
   const m = mockFetch(() => answer("block"));
   try {

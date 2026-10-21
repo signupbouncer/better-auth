@@ -57,8 +57,8 @@ await build({
     description:
       "Better Auth plugin that blocks disposable email, burner account and fake signups with SignupBouncer. Fails open.",
     license: "MIT",
-    author: "Final Dynamics LLC",
-    homepage: "https://signupbouncer.com/docs",
+    author: "SignupBouncer",
+    homepage: "https://signupbouncer.com",
     repository: { type: "git", url: "git+https://github.com/signupbouncer/better-auth.git" },
     bugs: { url: "https://github.com/signupbouncer/better-auth/issues" },
     keywords: [
