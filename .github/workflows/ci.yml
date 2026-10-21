@@ -1,5 +1,6 @@
-# Checks every push and pull request: format, lint, type check, tests, a JSR publish dry run, the npm build, and an
-# import of the built npm package in Node 22.0.0 (the lowest version package.json allows) and Node 24.
+# Checks every push and pull request: format, lint, type check, tests, a JSR publish dry run, the npm build, an
+# import of the built npm package in Node 22.0.0 (the lowest version package.json allows) and Node 24, and the
+# release tarball check (scripts/release_tarball.py) on the packed package.
 #
 # Actions are pinned to full commit SHAs (resolved with `git ls-remote` and checked with the GitHub API on
 # 14 Oct 2026). The comment after each SHA is the release tag it points at.
@@ -53,6 +54,13 @@ jobs:
             const p = m.signupBouncer({ apiKey: "sb_live_ci" });
             if (p.id !== "signupbouncer" || typeof p.hooks.before[0].handler !== "function") process.exit(1);
             console.log(process.version, "exports:", Object.keys(m).sort().join(" "));
-      - name: List what npm would publish
-        working-directory: npm
-        run: npm pack --dry-run --ignore-scripts
+      # The same tarball check the publish workflow's npm job runs, so a build change that would stop a release (a new
+      # publishConfig key, say) fails here first. npm pack also lists the files npm would publish.
+      - name: Pack the npm package and run the release tarball check
+        run: |
+          mkdir "${RUNNER_TEMP}/pack"
+          cd npm
+          npm pack --ignore-scripts --pack-destination "${RUNNER_TEMP}/pack"
+          version="$(node -p 'require("./package.json").version')"
+          python3 -I ../scripts/release_tarball.py "${RUNNER_TEMP}/pack/signupbouncer-better-auth-${version}.tgz" \
+            "${RUNNER_TEMP}/pack/clean.tgz" "@signupbouncer/better-auth" "${version}"

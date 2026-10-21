@@ -15,9 +15,10 @@ to https://signupbouncer.com.
 - **SignupBouncer** with both capitals in the doc comments JSR shows.
 - npm `author` is now `SignupBouncer` (was `Final Dynamics LLC`; the licence still names the company that holds the
   copyright) and `homepage` is the home page (was `/docs`).
-- **Release workflow** (signupbouncer/better-auth#3): the npm job publishes with npm trusted publishing (GitHub OIDC)
-  and holds no npm token. It receives one packed tarball from the build job and runs npm in a folder holding only that
-  file, so nothing the build writes can become npm configuration.
+- **Release workflow** (signupbouncer/better-auth#3): the npm job stages each version with npm trusted publishing
+  (GitHub OIDC) and holds no npm token; a version goes live on npm once approved on npmjs.com. The job receives one
+  packed tarball from the build job, checks it, writes a clean copy from what it checked, and runs npm in a folder
+  holding only that copy, so nothing the build writes can become npm configuration.
 
 ## 0.2.0
 

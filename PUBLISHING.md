@@ -55,8 +55,9 @@ only when you approve it on npmjs.com with your 2FA.
 
 3. Watch https://github.com/signupbouncer/better-auth/actions. The `verify` job refuses a tag that does not match
    `deno.json` or a published file that still holds a `[FILL ...]` placeholder. Then `jsr` publishes while `build-npm`
-   builds and packs the npm package in a job with no publishing rights. `npm` stages that tarball after both have
-   succeeded.
+   builds and packs the npm package in a job with no publishing rights. After both have succeeded, `npm` checks that
+   tarball with `scripts/release_tarball.py` (no links, odd paths, `.npmrc` or unexpected `publishConfig`), writes a
+   clean copy from what it checked, and stages that copy.
 4. Approve the staged version at npmjs.com (package > staged versions; needs your 2FA). Until then it is not live on
    npm; JSR publishes on its own. npm's docs call the page the "Staged Packages" tab of the package
    (https://docs.npmjs.com/staged-publishing): open https://www.npmjs.com/package/@signupbouncer/better-auth, go to that

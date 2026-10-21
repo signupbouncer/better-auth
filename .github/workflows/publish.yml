@@ -11,10 +11,11 @@
 #   live until the owner approves the staged version on npmjs.com with 2FA (https://docs.npmjs.com/staged-publishing).
 #   Provenance is generated at staging; `--provenance` makes a missing statement an error instead of a silent skip.
 #
-# Only the tarball crosses from the build job to the npm job. npm never packs an .npmrc, the npm job runs npm in a
-# directory holding nothing but that tarball (no project .npmrc), it checks the tarball's name, version and
-# publishConfig, and it names the registry on the command line, which wins over any config file or publishConfig. So
-# nothing the build writes can send the OIDC exchange or the upload to another host.
+# Only the tarball crosses from the build job to the npm job. The npm job checks it with scripts/release_tarball.py,
+# which refuses links, odd paths, repeated paths, an .npmrc and any package.json name, version or publishConfig other
+# than the expected ones, and writes a clean copy from exactly what it checked. npm runs in a directory holding only
+# that copy (no project .npmrc), with the registry named on the command line, which wins over any config file or
+# publishConfig. So nothing the build writes can send the OIDC exchange or the upload to another host.
 #
 # Keep this file's name and add no GitHub `environment:` to the npm job: the trusted publisher on npmjs.com names
 # workflow file publish.yml with no environment, and npm refuses a run that does not match.
@@ -129,33 +130,36 @@ jobs:
         with:
           name: npm-package
           path: ${{ runner.temp }}/release
-      - name: Exactly one tarball, for this package and version, with no placeholder or .npmrc in it
+      - name: Exactly one file in the artifact, the tarball for this version
         working-directory: ${{ runner.temp }}/release
         env:
           TAG: ${{ github.ref_name }}
         run: |
           tarball="signupbouncer-better-auth-${TAG#v}.tgz"
-          if [ "$(ls -A | wc -l)" != "1" ] || [ ! -f "${tarball}" ]; then
+          if [ "$(ls -A | wc -l)" != "1" ] || [ ! -f "${tarball}" ] || [ -L "${tarball}" ]; then
             echo "The artifact must hold exactly one file, ${tarball}:" >&2
             ls -lA >&2
             exit 1
           fi
-          if tar -tzf "${tarball}" | grep -E '(^|/)\.npmrc$'; then
-            echo "The tarball holds an .npmrc." >&2
-            exit 1
-          fi
-          mkdir "${RUNNER_TEMP}/inspect"
-          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/inspect"
-          if grep -rn '\[FILL' "${RUNNER_TEMP}/inspect"; then
-            echo "Fill in every [FILL ...] placeholder before releasing." >&2
-            exit 1
-          fi
-          # npm publish applies package.json's publishConfig, which could name another registry. Accept only the
-          # name, version and publishConfig scripts/build_npm.ts writes.
-          jq -e --arg v "${TAG#v}" '
-            .name == "@signupbouncer/better-auth" and .version == $v and
-            .publishConfig == { "access": "public", "provenance": true }
-          ' "${RUNNER_TEMP}/inspect/package/package.json"
+      # Only the checker script, from the tagged commit. It is this repository's own code, not build output.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: repo
+          sparse-checkout: scripts/release_tarball.py
+          sparse-checkout-cone-mode: false
+      - name: Check the tarball and write a clean copy for npm
+        # npm reads package.json's publishConfig as configuration, so a tarball with a second manifest, a link or an
+        # odd path could make npm use settings the check never saw (a proxy, another registry). The script reads the
+        # tarball in memory, refuses all of that, and writes a new tarball from exactly what it checked.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir "${RUNNER_TEMP}/clean"
+          python3 -I repo/scripts/release_tarball.py \
+            "${RUNNER_TEMP}/release/signupbouncer-better-auth-${TAG#v}.tgz" \
+            "${RUNNER_TEMP}/clean/signupbouncer-better-auth-${TAG#v}.tgz" \
+            "@signupbouncer/better-auth" "${TAG#v}"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
@@ -172,10 +176,10 @@ jobs:
             }
           ' "$(npm --version)"
       - name: Stage the release on npm
-        # This directory holds only the tarball (checked above), so there is no project .npmrc for npm to read, and
-        # the registry is given on the command line, which beats any config file and publishConfig. The scoped
-        # registry is pinned too, because npm prefers it over --registry.
-        working-directory: ${{ runner.temp }}/release
+        # This directory holds only the clean tarball, so there is no project .npmrc for npm to read, and the
+        # registry is given on the command line, which beats any config file and publishConfig. The scoped registry is
+        # pinned too, because npm prefers it over --registry.
+        working-directory: ${{ runner.temp }}/clean
         env:
           TAG: ${{ github.ref_name }}
         run: >-
