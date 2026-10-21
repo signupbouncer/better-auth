@@ -3,10 +3,21 @@
 # - verify: tag matches deno.json, no "[FILL" placeholder left in a published file, checks and tests pass.
 # - jsr: `deno publish`, authenticated with GitHub's OIDC token (no secret). The JSR package must be linked to this
 #   repository in its settings on jsr.io first (https://jsr.io/docs/publishing-packages#publishing-from-github-actions).
-# - build-npm: builds npm/ with dnt in a job that holds no OIDC permission and no secret, and hands the files on as an
-#   artifact. Build tooling never runs where publishing credentials exist.
-# - npm: downloads that artifact and runs `npm publish --provenance --access public` with the NPM_TOKEN repository
-#   secret. It needs id-token: write for the provenance statement (https://docs.npmjs.com/generating-provenance-statements).
+# - build-npm: builds npm/ with dnt in a job that holds no OIDC permission and no secret, packs it with `npm pack`, and
+#   hands on the one .tgz file as an artifact. Build tooling never runs where publishing credentials exist.
+# - npm: stages that tarball on npm with `npm stage publish`, authenticated by npm trusted publishing: npm exchanges
+#   GitHub's OIDC token for a short-lived token that works for this package only (https://docs.npmjs.com/trusted-publishers).
+#   There is no npm token in this repository. The trusted publisher on npmjs.com allows staging only, so nothing goes
+#   live until the owner approves the staged version on npmjs.com with 2FA (https://docs.npmjs.com/staged-publishing).
+#   Provenance is generated at staging; `--provenance` makes a missing statement an error instead of a silent skip.
+#
+# Only the tarball crosses from the build job to the npm job. npm never packs an .npmrc, the npm job runs npm in a
+# directory holding nothing but that tarball (no project .npmrc), it checks the tarball's name, version and
+# publishConfig, and it names the registry on the command line, which wins over any config file or publishConfig. So
+# nothing the build writes can send the OIDC exchange or the upload to another host.
+#
+# Keep this file's name and add no GitHub `environment:` to the npm job: the trusted publisher on npmjs.com names
+# workflow file publish.yml with no environment, and npm refuses a run that does not match.
 #
 # Actions are pinned to full commit SHAs (resolved with `git ls-remote` and checked with the GitHub API on
 # 14 Oct 2026). The comment after each SHA is the release tag it points at.
@@ -93,40 +104,82 @@ jobs:
             const m = await import("./esm/mod.js");
             if (m.signupBouncer({ apiKey: "sb_live_ci" }).id !== "signupbouncer") process.exit(1);
           '
+      - name: Pack the npm package into one tarball
+        run: |
+          mkdir dist
+          cd npm
+          npm pack --ignore-scripts
+          mv signupbouncer-better-auth-*.tgz ../dist/
+          ls -l ../dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
-          include-hidden-files: true # .npmignore
           if-no-files-found: error
           retention-days: 7
-          path: |
-            npm/
-            !npm/node_modules/
-            !npm/deno.lock
+          path: dist/*.tgz
 
   npm:
     needs: [build-npm, jsr]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # needed for npm provenance
+      id-token: write # trusted publishing: the GitHub OIDC token npm exchanges for a short-lived publish token
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: npm-package
-          path: npm
-      - name: No placeholder left in the package
+          path: ${{ runner.temp }}/release
+      - name: Exactly one tarball, for this package and version, with no placeholder or .npmrc in it
+        working-directory: ${{ runner.temp }}/release
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          if grep -rn '\[FILL' npm; then
+          tarball="signupbouncer-better-auth-${TAG#v}.tgz"
+          if [ "$(ls -A | wc -l)" != "1" ] || [ ! -f "${tarball}" ]; then
+            echo "The artifact must hold exactly one file, ${tarball}:" >&2
+            ls -lA >&2
+            exit 1
+          fi
+          if tar -tzf "${tarball}" | grep -E '(^|/)\.npmrc$'; then
+            echo "The tarball holds an .npmrc." >&2
+            exit 1
+          fi
+          mkdir "${RUNNER_TEMP}/inspect"
+          tar -xzf "${tarball}" -C "${RUNNER_TEMP}/inspect"
+          if grep -rn '\[FILL' "${RUNNER_TEMP}/inspect"; then
             echo "Fill in every [FILL ...] placeholder before releasing." >&2
             exit 1
           fi
+          # npm publish applies package.json's publishConfig, which could name another registry. Accept only the
+          # name, version and publishConfig scripts/build_npm.ts writes.
+          jq -e --arg v "${TAG#v}" '
+            .name == "@signupbouncer/better-auth" and .version == $v and
+            .publishConfig == { "access": "public", "provenance": true }
+          ' "${RUNNER_TEMP}/inspect/package/package.json"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-      - name: Publish to npm
-        working-directory: npm
+          # No registry-url: setup-node would write an .npmrc that reads NODE_AUTH_TOKEN, and there is no token.
+      - name: npm is new enough for staged publishing
+        # `npm stage` needs npm 11.15.0 or later (https://docs.npmjs.com/staged-publishing); trusted publishing needs
+        # 11.5.1. Node 24.18.0 and later bundle a new enough npm, so "24" (the latest 24.x) needs no npm upgrade.
+        run: |
+          node -e '
+            const [a, b] = process.argv[1].split(".").map(Number);
+            if (a < 11 || (a === 11 && b < 15)) {
+              console.error(`npm ${process.argv[1]} is older than 11.15.0, which npm stage needs.`);
+              process.exit(1);
+            }
+          ' "$(npm --version)"
+      - name: Stage the release on npm
+        # This directory holds only the tarball (checked above), so there is no project .npmrc for npm to read, and
+        # the registry is given on the command line, which beats any config file and publishConfig. The scoped
+        # registry is pinned too, because npm prefers it over --registry.
+        working-directory: ${{ runner.temp }}/release
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public --ignore-scripts
+          TAG: ${{ github.ref_name }}
+        run: >-
+          npm stage publish "./signupbouncer-better-auth-${TAG#v}.tgz"
+          --access public --provenance --ignore-scripts
+          --registry=https://registry.npmjs.org/
+          --@signupbouncer:registry=https://registry.npmjs.org/
