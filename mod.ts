@@ -24,6 +24,17 @@
  *   https://better-auth.com/docs/concepts/database#database-hooks. Better Auth passes the endpoint context as the
  *   second argument, with the route pattern in `path` (`/callback/:id`) and the values in `params`.
  *
+ * The second look at email confirmation (`secondLook`, {@linkcode signupBouncerConfirm}; checked 2026-10-22 against
+ * better-auth 1.7.0, 1.7.7 and 1.7.11 from npm, `dist/api/routes/email-verification.mjs`,
+ * `dist/plugins/email-otp/routes.mjs` and `dist/db/with-hooks.mjs`):
+ * - `GET /verify-email` marks the address verified with
+ *   `internalAdapter.updateUserByEmail(email, { emailVerified: true })`, which runs `databaseHooks.user.update.before`
+ *   with that data and `update.after` with the saved user, both with the endpoint context. An email change adds
+ *   `email` to that data.
+ * - `emailVerification.beforeEmailVerification(user, request)` runs just before that update, on `/verify-email` and
+ *   on the email-OTP plugin's `/email-otp/verify-email` and `/email-otp/change-email` (typed in `@better-auth/core`
+ *   `dist/types/init-options.d.mts`). Throwing from it leaves the address unverified.
+ *
  * @module
  */
 
@@ -32,9 +43,12 @@ import { APIError, createAuthMiddleware } from "better-auth/api";
 import {
   clientIp,
   configuredSocialProviders,
+  firstStandsCode,
   type HookCtx,
   isCheckableEmail,
   isCompleteAnswer,
+  isCompleteConfirmAnswer,
+  isConfirmBlock,
   normalizeIp,
   readCapped,
   socialProviderFor,
@@ -63,6 +77,11 @@ export interface CheckError {
   reason: CheckErrorReason;
   /** HTTP status, for `http_status` and `bad_response`. */
   status?: number;
+  /**
+   * `"confirm"` when the call that failed reported an email confirmation (`POST /v1/confirm`, see
+   * {@linkcode confirmSignup}); the confirmation has already gone through. Absent for a sign-up check.
+   */
+  call?: "confirm";
 }
 
 /** A complete `/v1/check` answer. The plugin acts on one only when every field below is present and well-typed. */
@@ -178,6 +197,15 @@ export interface SignupBouncerOptions {
    * an email sign-up. Default `false`.
    */
   checkOtherSignups?: boolean;
+  /**
+   * Report each email confirmation to SignupBouncer for the second look at challenged sign-ups (`POST /v1/confirm`):
+   * when a user clicks the link in Better Auth's verification email (`/verify-email`), the plugin sends the address,
+   * the User-Agent and, with an IP source, the IP, with `via: "link"`. Record only: it never refuses a confirmation,
+   * whatever the answer, because mail scanners open links too. It runs after Better Auth has marked the address
+   * verified, and waits at most 1 second (less with a lower `timeoutMs`). To refuse a confirmation on a page of your
+   * own with a button, use {@linkcode signupBouncerConfirm} instead. Default `false`.
+   */
+  secondLook?: boolean;
 }
 
 /** The API origin used when `baseUrl` is not set. */
@@ -188,6 +216,13 @@ export const DEFAULT_TIMEOUT_MS = 1500;
 export const MAX_TIMEOUT_MS = 10_000;
 /** The message a blocked sign-up gets when neither `blockMessage` nor the answer has one. */
 export const DEFAULT_BLOCK_MESSAGE = "Please sign up with a permanent email address.";
+/**
+ * The longest a confirmation report waits for SignupBouncer, in milliseconds. SignupBouncer answers `/v1/confirm`
+ * within 500 ms and asks clients to give the call 0.8 to 1 second. A lower `timeoutMs` lowers it.
+ */
+export const CONFIRM_TIMEOUT_MS = 1000;
+/** The message a refused confirmation gets when neither `blockMessage` nor the answer has one. */
+export const DEFAULT_CONFIRM_MESSAGE = "We couldn't confirm your email address. Please contact us if you need help.";
 
 /**
  * The `onError` used when you pass none: one `console.warn` line. It holds the fixed reason and the status code only,
@@ -195,23 +230,29 @@ export const DEFAULT_BLOCK_MESSAGE = "Please sign up with a permanent email addr
  */
 function warnCheckError(error: CheckError): void {
   const status = typeof error.status === "number" ? ` ${error.status}` : "";
+  const confirm = error.call === "confirm";
   const hint = error.reason === "missing_api_key" || error.reason === "malformed_api_key" || error.status === 401
     ? " Check the signupbouncer API key in your config."
     // 403 app_mismatch and 404 unknown_app are the only 403 and 404 /v1/check sends, both about the `app` option.
+    // /v1/confirm sends 403 app_mismatch too; its own 404 (unknown_check) is never reported.
     : error.status === 403
     ? " Check the app option: leave it out, or set it to the API key's own app id."
-    : error.status === 404
+    : error.status === 404 && !confirm
     // Only an older all-apps key gets 404; leaving `app` out would move its checks to the account's first app.
     ? " Check the app option: set it to an app id from this API key's account."
     : "";
-  console.warn(`[signupbouncer] check failed (${error.reason}${status}), sign-up allowed.${hint}`);
+  console.warn(
+    confirm
+      ? `[signupbouncer] confirmation report failed (${error.reason}${status}), confirmation allowed.${hint}`
+      : `[signupbouncer] check failed (${error.reason}${status}), sign-up allowed.${hint}`,
+  );
 }
 
 function timeoutOf(ms: number | undefined): number {
   return typeof ms === "number" && ms > 0 ? Math.min(ms, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS; // NaN > 0 is false
 }
 
-function report(onError: SignupBouncerOptions["onError"], error: CheckError): CheckResult {
+function notify(onError: SignupBouncerOptions["onError"], error: CheckError): void {
   // A broken or slow onError must not fail or delay the sign-up: not awaited, sync throws and rejections ignored.
   try {
     const pending: unknown = (onError ?? warnCheckError)(error);
@@ -221,6 +262,10 @@ function report(onError: SignupBouncerOptions["onError"], error: CheckError): Ch
   } catch {
     // ignored
   }
+}
+
+function report(onError: SignupBouncerOptions["onError"], error: CheckError): CheckResult {
+  notify(onError, error);
   return { ok: false, action: "allow", error };
 }
 
@@ -381,6 +426,263 @@ function messageOrUndefined(m: unknown): string | undefined {
   return typeof m === "string" && m.trim() !== "" && m.length <= 500 ? m : undefined;
 }
 
+// ---- Second look at email confirmation (POST /v1/confirm) ----------------------------------------------------------
+
+/**
+ * How the person confirmed their address:
+ * - `"link"`: the click on the emailed link confirmed it by itself. Mail scanners open links too, so SignupBouncer
+ *   never scores that request's IP or browser, and the plugin never refuses a link confirmation.
+ * - `"button"`: the person pressed a button on a page of your own (the emailed link opens the page; the button calls
+ *   `authClient.verifyEmail`).
+ * - `"code"`: the person typed a code, such as with Better Auth's email OTP plugin.
+ */
+export type ConfirmVia = "link" | "button" | "code";
+
+/** A complete `/v1/confirm` answer. The plugin acts on one only when every field below is present and well-typed. */
+export interface ConfirmResponse {
+  /** The result before the app's mode is applied. Never act on it: in shadow mode it can say block. */
+  verdict: "allow" | "block";
+  /** What to do: the same as `verdict` in enforce mode, always `"allow"` in shadow mode. */
+  action: "allow" | "block";
+  /** The app's mode in your SignupBouncer dashboard. */
+  mode: "shadow" | "enforce";
+  /** Risk score after the second look (or the first check's, when there was none). */
+  score: number;
+  /** Id of the sign-up's check in your dashboard log (`chk_...`). `null` in an error answer that found none. */
+  check_id: string | null;
+  /** The first check's result and score. `null` in an error answer. */
+  first: { verdict: SignupAction; score: number } | null;
+  /** The first check's reasons and the new ones. */
+  reasons: { code: string; detail: string; points: number; tier: string }[];
+  /** What a higher plan would also have flagged. */
+  shadow: { code: string; detail: string; tier: string }[];
+  /** True when this check got a second look. Only a challenged sign-up that was let through gets one. */
+  second_look: boolean;
+  /** True when an earlier report of the same check already had the second look, and this is its answer again. */
+  replayed: boolean;
+  /** Time the report took on SignupBouncer's side, in milliseconds. */
+  latency_ms: number;
+  /** Sent with a block: the message from the Rules tab of your dashboard, or a neutral default. */
+  block_message?: string;
+  /** `"internal_error"` when something failed on SignupBouncer's side. The answer is then an allow. */
+  error?: string;
+  /** Fields added to the API later. */
+  [key: string]: unknown;
+}
+
+/**
+ * Result of one confirmation report. `action` is the plugin's decision:
+ * - `ok: true`: SignupBouncer answered. `action` is `"block"` only for a `"button"` or `"code"` confirmation whose
+ *   answer is a complete enforce-mode block from a second look; otherwise `"allow"`, including every `"link"` one.
+ * - `ok: false`: the report failed, or SignupBouncer has no second look for it (404 `unknown_check`, 410
+ *   `check_expired`, which do not call `onError`). The confirmation goes through.
+ */
+export type ConfirmResult =
+  | { ok: true; action: "allow" | "block"; response: ConfirmResponse }
+  | { ok: false; action: "allow"; error: CheckError };
+
+function confirmFailed(onError: SignupBouncerOptions["onError"], error: CheckError, quiet = false): ConfirmResult {
+  const e: CheckError = { ...error, call: "confirm" };
+  if (!quiet) notify(onError, e);
+  return { ok: false, action: "allow", error: e };
+}
+
+/**
+ * Calls `POST {baseUrl}/v1/confirm` to report an email confirmation, for the second look at challenged sign-ups.
+ * Never throws. SignupBouncer looks at a challenged sign-up again with the confirming request and answers allow or
+ * block; any other sign-up keeps its first answer. Exported so you can report confirmations from your own routes.
+ *
+ * Fails open like {@linkcode checkSignup}: a timeout, a network error, a non-2xx answer or an unreadable or incomplete
+ * answer returns `action: "allow"` and calls `onError` (with `call: "confirm"`). A 404 `unknown_check` (no sign-up of
+ * this address or check id in the last 72 hours on this key's app) and a 410 `check_expired` return `action: "allow"`
+ * without calling `onError`. It waits at most {@linkcode CONFIRM_TIMEOUT_MS} (1 second), or `timeoutMs` when lower.
+ * The request does not follow redirects, and only the first 64 KiB of an answer are read.
+ *
+ * @param options The API key and connection settings, as for {@linkcode signupBouncer}.
+ * @param input The confirmed address (or the `check_id` from `/v1/check`), the confirming request's IP and/or
+ *   User-Agent, and how the person confirmed. With neither an address nor a check id, or neither an IP nor a
+ *   User-Agent, nothing is sent (`onError` "no_input").
+ * @returns The action to take, with the API's answer or the reason the report failed.
+ */
+export async function confirmSignup(
+  options: Pick<SignupBouncerOptions, "apiKey" | "baseUrl" | "app" | "timeoutMs" | "onError">,
+  input: {
+    /** The address that was confirmed, as your app saves it. */
+    email?: string;
+    /** The `check_id` `/v1/check` answered for this sign-up, if you kept it. It wins over `email`. */
+    checkId?: string;
+    /** The IP of the request that confirmed, from a header your host overwrites. */
+    ip?: string;
+    /** The User-Agent header of the request that confirmed. Cut to 512 characters. */
+    userAgent?: string;
+    /** How the person confirmed. Default (and for any other value) `"link"`, which never refuses. */
+    via?: ConfirmVia;
+  },
+): Promise<ConfirmResult> {
+  const onError = options.onError;
+  const apiKey = options.apiKey?.trim() ?? "";
+  if (!apiKey) return confirmFailed(onError, { reason: "missing_api_key" });
+  // A key with a newline or other junk pasted in: fetch would reject the header and quote the key in its error.
+  if (!/^[\x21-\x7e]+$/.test(apiKey)) return confirmFailed(onError, { reason: "malformed_api_key" });
+  const via: ConfirmVia = input.via === "button" || input.via === "code" ? input.via : "link";
+  const body: Record<string, string> = { via };
+  if (typeof input.checkId === "string" && input.checkId) body.check_id = input.checkId;
+  if (typeof input.email === "string" && input.email) body.email = input.email;
+  if (typeof input.ip === "string" && input.ip) body.ip = input.ip;
+  if (typeof input.userAgent === "string" && input.userAgent) body.user_agent = input.userAgent.slice(0, 512);
+  if (options.app) body.app = options.app;
+  // The API needs a check id or an address, and the confirming request's IP or User-Agent (400 invalid_body).
+  if ((!body.check_id && !body.email) || (!body.ip && !body.user_agent)) {
+    return confirmFailed(onError, { reason: "no_input" });
+  }
+
+  const timeoutMs = Math.min(timeoutOf(options.timeoutMs), CONFIRM_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const late = () => controller.signal.aborted || Date.now() > deadline;
+  const url = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "") + "/v1/confirm";
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+      redirect: "manual", // as in checkSignup: a redirect is a failed report, and the key goes nowhere else
+    });
+  } catch {
+    clearTimeout(timer);
+    return confirmFailed(onError, { reason: controller.signal.aborted ? "timeout" : "network" });
+  }
+  try {
+    let text: string | { failed: string };
+    if (!res.ok) {
+      // 404 unknown_check and 410 check_expired mean "no second look, the first answer stands": not a failure.
+      if (res.status === 404 || res.status === 410) {
+        try {
+          text = await readCapped(res, controller.signal);
+        } catch {
+          text = "";
+        }
+        const code = typeof text === "string" ? firstStandsCode(text) : undefined;
+        const quiet = (res.status === 404 && code === "unknown_check") ||
+          (res.status === 410 && code === "check_expired");
+        return confirmFailed(onError, { reason: "http_status", status: res.status }, quiet);
+      }
+      try {
+        res.body?.cancel().catch(() => {});
+      } catch {
+        // a locked or broken body: nothing to free
+      }
+      return confirmFailed(onError, { reason: "http_status", status: res.status });
+    }
+    try {
+      text = await readCapped(res, controller.signal);
+    } catch {
+      return confirmFailed(onError, late() ? { reason: "timeout" } : { reason: "bad_response", status: res.status });
+    }
+    if (typeof text !== "string") {
+      return confirmFailed(
+        onError,
+        text.failed === "aborted" ? { reason: "timeout" } : { reason: "bad_response", status: res.status },
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return confirmFailed(onError, { reason: "bad_response", status: res.status });
+    }
+    if (!isCompleteConfirmAnswer(parsed)) return confirmFailed(onError, { reason: "bad_response", status: res.status });
+    // An answer that arrived after the deadline is a timeout: the person has been let through already.
+    if (late()) return confirmFailed(onError, { reason: "timeout" });
+    const response = parsed as ConfirmResponse;
+    if (messageOrUndefined(response.block_message) === undefined) delete response.block_message;
+    // A link confirmation is record only: mail scanners open links, so its answer never refuses anyone.
+    const block = via !== "link" && isConfirmBlock(response);
+    return { ok: true, action: block ? "block" : "allow", response };
+  } catch {
+    return confirmFailed(onError, late() ? { reason: "timeout" } : { reason: "bad_response", status: res.status });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * The message to show a refused confirmation: the `block_message` SignupBouncer sent with the answer (set on the Rules
+ * tab of your dashboard), or {@linkcode DEFAULT_CONFIRM_MESSAGE} when there is none.
+ *
+ * @param result A result from {@linkcode confirmSignup}.
+ */
+export function confirmBlockMessage(result: ConfirmResult): string {
+  return messageOrUndefined(result.ok ? result.response.block_message : undefined) ?? DEFAULT_CONFIRM_MESSAGE;
+}
+
+/**
+ * Requests already reported by {@linkcode signupBouncerConfirm}, so the plugin's own `secondLook` report skips them.
+ * Entries go with the request.
+ */
+const confirmReported = new WeakSet<object>();
+
+// The email-OTP plugin's email change also runs beforeEmailVerification: a change of address, not a sign-up.
+const EMAIL_CHANGE = /\/email-otp\/change-email$/;
+
+function requestPath(request: Request | undefined): string {
+  try {
+    return request ? new URL(request.url).pathname : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * A second look that can refuse the confirmation, for Better Auth's `emailVerification.beforeEmailVerification`. Use
+ * it only when the person's own action confirms the address: your verification email links to a page of your own
+ * whose button calls `authClient.verifyEmail` (`via: "button"`), or the person types a code from the email OTP plugin
+ * (`via: "code"`). Better Auth runs it just before it marks the address verified; on a refusal it throws `APIError`
+ * 403 `{ code: "SIGNUP_BLOCKED", message }` and the address stays unverified. Every failure lets the confirmation
+ * through, and in shadow mode nothing is refused.
+ *
+ * Do not use it when the emailed link goes straight to Better Auth's `/verify-email`: that click is not a button press,
+ * and mail scanners open links too. Use the plugin's `secondLook: true` there, which only records.
+ *
+ * ```ts
+ * const sb = { apiKey: process.env.SIGNUPBOUNCER_API_KEY!, ipHeader: "cf-connecting-ip" };
+ * export const auth = betterAuth({
+ *   emailVerification: {
+ *     sendVerificationEmail, // your own: its link opens your page with the button
+ *     beforeEmailVerification: signupBouncerConfirm({ ...sb, via: "button" }),
+ *   },
+ *   plugins: [signupBouncer(sb)],
+ * });
+ * ```
+ *
+ * @param options Your API key and settings, as for {@linkcode signupBouncer}, and `via`: how the person confirms.
+ *   A `via` other than `"button"` or `"code"` reports `"link"` and never refuses.
+ * @returns The function to pass as `beforeEmailVerification`.
+ */
+export function signupBouncerConfirm(
+  options: SignupBouncerOptions & { via: "button" | "code" },
+): (user: { email: string }, request?: Request) => Promise<void> {
+  return async (user, request) => {
+    if (EMAIL_CHANGE.test(requestPath(request))) return;
+    const email = typeof user?.email === "string" && user.email !== "" ? user.email : undefined;
+    const headers = request?.headers;
+    const ip = ipFrom(options, request, headers);
+    const userAgent = headers?.get("user-agent") ?? undefined;
+    if (email === undefined || (!ip && !userAgent)) return;
+    if (request) confirmReported.add(request);
+    const result = await confirmSignup(options, { email, ip, userAgent, via: options.via });
+    if (result.action === "block") {
+      throw new APIError("FORBIDDEN", {
+        message: options.blockMessage ?? confirmBlockMessage(result),
+        code: "SIGNUP_BLOCKED",
+      });
+    }
+  };
+}
+
 // The error a refused sign-up gets: HTTP 400 with { code, message } and, when the answer carries the "Why was this
 // refused?" link, why_url next to them (the same field name as SignupBouncer's copy-paste Better Auth hook).
 function blockError(message: string, why: string | null): APIError {
@@ -390,8 +692,27 @@ function blockError(message: string, why: string | null): APIError {
 const SKIP_PATH = /^\/admin\/|^\/sign-in\/anonymous$/;
 const EMAIL_SIGNUP = "/sign-up/email";
 
+// Where Better Auth's GET /verify-email marks the address verified (the link in its verification email).
+const VERIFY_EMAIL = "/verify-email";
+
 function headersOf(ctx: HookCtx): Headers | undefined {
   return ctx?.headers ?? ctx?.request?.headers ?? undefined;
+}
+
+/** The client IP from `getIp`, or else from `ipHeader`; `undefined` when there is none or `getIp` throws. */
+function ipFrom(
+  options: Pick<SignupBouncerOptions, "getIp" | "ipHeader" | "trustedProxies">,
+  request: Request | undefined,
+  headers: Headers | undefined,
+): string | undefined {
+  if (options.getIp) {
+    try {
+      return normalizeIp(options.getIp(request, headers));
+    } catch {
+      return undefined; // a broken getIp must not fail the sign-up
+    }
+  }
+  return clientIp(headers, options.ipHeader, options.trustedProxies);
 }
 
 /**
@@ -400,6 +721,9 @@ function headersOf(ctx: HookCtx): Headers | undefined {
  * Email/password sign-ups are checked in two places: a before hook checks the address in the request, and a
  * `user.create.before` database hook checks the user Better Auth is about to save. The second check makes a request
  * only when the saved address differs from the one already checked, for example when another hook rewrote it.
+ *
+ * With `secondLook: true`, `user.update.before` and `user.update.after` database hooks report each click on Better
+ * Auth's verification link to SignupBouncer once the address is verified. They never refuse anything.
  *
  * @param options Your API key and settings. See {@linkcode SignupBouncerOptions}.
  * @returns A Better Auth plugin with the id `"signupbouncer"`.
@@ -411,16 +735,28 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
   const allowedEmail = new WeakMap<object, string>();
   const requestKey = (ctx: HookCtx): object | undefined => ctx?.request ?? ctx?.headers ?? undefined;
 
-  const ipOf = (ctx: HookCtx): string | undefined => {
-    const headers = headersOf(ctx);
-    if (options.getIp) {
-      try {
-        return normalizeIp(options.getIp(ctx?.request ?? undefined, headers));
-      } catch {
-        return undefined; // a broken getIp must not fail the sign-up
-      }
+  const ipOf = (ctx: HookCtx): string | undefined => ipFrom(options, ctx?.request ?? undefined, headersOf(ctx));
+  // Requests whose user update is Better Auth marking the address verified on /verify-email (seen by update.before),
+  // reported once the update is saved (update.after).
+  const verifying = new WeakSet<object>();
+
+  // secondLook: record only. The address is already verified when this runs, and the answer is never acted on.
+  const reportConfirmation = async (user: { email?: unknown; emailVerified?: unknown }, ctx: HookCtx) => {
+    const key = requestKey(ctx);
+    if (!key || !verifying.has(key)) return;
+    verifying.delete(key);
+    // Already reported by signupBouncerConfirm in beforeEmailVerification for this request.
+    if (confirmReported.has(key)) return;
+    if (user?.emailVerified !== true || typeof user.email !== "string" || user.email === "") return;
+    const ip = ipOf(ctx);
+    const userAgent = headersOf(ctx)?.get("user-agent") ?? undefined;
+    // The API needs the IP or the User-Agent; server code verifying without a request has neither.
+    if (!ip && !userAgent) return;
+    try {
+      await confirmSignup(options, { email: user.email, ip, userAgent, via: "link" });
+    } catch {
+      // confirmSignup never throws; a confirmation must never fail because of the report
     }
-    return clientIp(headers, options.ipHeader, options.trustedProxies);
   };
 
   const enforce = async (
@@ -489,6 +825,24 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
                   );
                 },
               },
+              ...(options.secondLook
+                ? {
+                  update: {
+                    // deno-lint-ignore require-await
+                    before: async (data: Record<string, unknown>, ctx?: HookCtx) => {
+                      // /verify-email marks the address verified with { emailVerified: true } alone. An email change
+                      // confirmed there also sets `email`: a change of address, not a sign-up's confirmation.
+                      if (ctx?.path !== VERIFY_EMAIL || typeof data !== "object" || data === null) return;
+                      if (data.emailVerified !== true || "email" in data) return;
+                      const key = requestKey(ctx);
+                      if (key) verifying.add(key);
+                    },
+                    after: async (user: { email?: unknown; emailVerified?: unknown }, ctx?: HookCtx) => {
+                      await reportConfirmation(user, ctx);
+                    },
+                  },
+                }
+                : {}),
             },
           },
         },

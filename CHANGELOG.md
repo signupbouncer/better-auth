@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+The plugin can now tell SignupBouncer when a user clicks the link in Better Auth's verification email, so a challenged
+sign-up gets SignupBouncer's second look at email confirmation. It only records: it never refuses a confirmation, and it
+is off until you set `secondLook: true`. Apps whose verification email opens a page of their own with a button, or that
+use email OTP codes, can let the second look refuse a confirmation with `signupBouncerConfirm`.
+
+- **`secondLook: true`** (default `false`, so upgrading sends nothing new). After Better Auth marks an address verified
+  on `GET /verify-email`, the plugin sends `POST /v1/confirm` with the address, the User-Agent, the client IP when you
+  configure a source for it, and `via: "link"`. It never acts on the answer, because mail scanners open links too. The
+  click waits at most 1 second (`CONFIRM_TIMEOUT_MS`, or `timeoutMs` when lower), and any failure lets it through. An
+  email change confirmed through the same link sends nothing.
+- **`signupBouncerConfirm({ ...options, via: "button" | "code" })`**, for Better Auth's
+  `emailVerification.beforeEmailVerification`. When a complete enforce-mode answer from a second look says block, it
+  throws HTTP 403 `{ code: "SIGNUP_BLOCKED", message }` and the address stays unverified. Shadow mode, a check with no
+  second look, a timeout and any error let the confirmation through. It skips the email OTP plugin's email change.
+- **`confirmSignup(options, input)`** and **`confirmBlockMessage(result)`**: the same report from your own routes. It
+  never throws; with `via: "link"` (the default) its `action` is always `"allow"`.
+- **`onError` for reports.** A failed report calls `onError` with `call: "confirm"`, and the default warning says
+  "confirmation report failed ..., confirmation allowed." A 404 `unknown_check` or 410 `check_expired` (no sign-up of
+  that address in the last 72 hours) is the first answer standing and calls no `onError`.
+- New exports: `ConfirmVia`, `ConfirmResponse`, `ConfirmResult`, `CONFIRM_TIMEOUT_MS`, `DEFAULT_CONFIRM_MESSAGE`, and
+  `call` on `CheckError`.
+
 ## 0.2.1
 
 A user whose address has a quoted part with a space, such as `"first last"@company.co.uk`, is no longer refused before

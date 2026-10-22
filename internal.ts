@@ -91,6 +91,40 @@ export function isCompleteAnswer(v: unknown): boolean {
   return action === "allow" || (mode === "enforce" && v.quota_exceeded === false && action === verdict);
 }
 
+const CONFIRM_ACTIONS = new Set<string>(["allow", "block"]);
+
+/**
+ * True only for a complete `/v1/confirm` answer: every field the API always sends with a 200, with the right type. Our
+ * own error answer (`"error": "internal_error"`, an allow with `check_id` and `first` possibly `null`) counts as one.
+ * Anything partial or mistyped counts as a failed report (`onError` "bad_response"), and the confirmation goes through.
+ */
+export function isCompleteConfirmAnswer(v: unknown): v is Record<string, unknown> {
+  if (!isObj(v)) return false;
+  const { action, verdict, mode, reasons, shadow, first } = v;
+  if (!isStr(action) || !CONFIRM_ACTIONS.has(action) || !isStr(verdict) || !CONFIRM_ACTIONS.has(verdict)) return false;
+  if (mode !== "shadow" && mode !== "enforce") return false;
+  if (!isNum(v.score) || !isStrOrNull(v.check_id) || !isNum(v.latency_ms)) return false;
+  if (typeof v.second_look !== "boolean" || typeof v.replayed !== "boolean") return false;
+  if (first !== null && !(isObj(first) && isStr(first.verdict) && ACTIONS.has(first.verdict) && isNum(first.score))) {
+    return false;
+  }
+  const reasonOk = (r: unknown) => isObj(r) && isStr(r.code) && isStr(r.detail) && isNum(r.points) && isStr(r.tier);
+  if (!Array.isArray(reasons) || !reasons.every(reasonOk)) return false;
+  const shadowOk = (r: unknown) => isObj(r) && isStr(r.code) && isStr(r.detail) && isStr(r.tier);
+  return Array.isArray(shadow) && shadow.every(shadowOk);
+}
+
+/**
+ * True only for an answer that refuses a confirmation: complete, `action` and `verdict` both `"block"`, enforce mode,
+ * from a second look (`second_look: true`) of a known check, and not our error answer. A check that got no second look
+ * (`second_look: false`, the first answer standing) never refuses one, the same rule as SignupBouncer's fetch helper
+ * (`confirmationRefusal` in the SignupBouncer repo).
+ */
+export function isConfirmBlock(v: unknown): boolean {
+  return isCompleteConfirmAnswer(v) && v.action === "block" && v.verdict === "block" && v.mode === "enforce" &&
+    v.second_look === true && isStr(v.check_id) && !("error" in v);
+}
+
 /** Why {@link readCapped} gave up. */
 export type ReadFailure = "too_large" | "aborted";
 
@@ -150,6 +184,20 @@ export async function readCapped(
     offset += c.byteLength;
   }
   return new TextDecoder().decode(all);
+}
+
+/**
+ * The `error` code of a `/v1/confirm` 404 or 410 body that means "no second look, the first answer stands"
+ * (`unknown_check`, `check_expired`), or `undefined` for anything else. Those two are an ordinary outcome, such as a
+ * user who signed up before the plugin was installed or confirmed after 72 hours, not a failure to report.
+ */
+export function firstStandsCode(text: string): "unknown_check" | "check_expired" | undefined {
+  try {
+    const error = (JSON.parse(text) as { error?: unknown } | null)?.error;
+    return error === "unknown_check" || error === "check_expired" ? error : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // A subset of what the API accepts (letters, digits, . _ : -; 40 at most) that must start with a letter or digit, so a
