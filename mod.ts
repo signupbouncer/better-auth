@@ -26,14 +26,18 @@
  *
  * The second look at email confirmation (`secondLook`, {@linkcode signupBouncerConfirm}; checked 2026-10-22 against
  * better-auth 1.7.0, 1.7.7 and 1.7.11 from npm, `dist/api/routes/email-verification.mjs`,
- * `dist/plugins/email-otp/routes.mjs` and `dist/db/with-hooks.mjs`):
- * - `GET /verify-email` marks the address verified with
- *   `internalAdapter.updateUserByEmail(email, { emailVerified: true })`, which runs `databaseHooks.user.update.before`
- *   with that data and `update.after` with the saved user, both with the endpoint context. An email change adds
- *   `email` to that data.
+ * `dist/plugins/email-otp/routes.mjs`, `dist/db/with-hooks.mjs`, `dist/db/revoke-unproven-account-access.mjs`,
+ * `dist/api/dispatch.mjs` and `dist/context/helpers.mjs`):
+ * - `GET /verify-email` checks the token (an HS256 JWT signed with `ctx.context.secret`), then marks the address
+ *   verified with `internalAdapter.updateUserByEmail(email, { emailVerified: true })`. On an address already verified
+ *   it answers without updating anything. Plugin `hooks.after` run after the endpoint, a thrown redirect included.
  * - `emailVerification.beforeEmailVerification(user, request)` runs just before that update, on `/verify-email` and
  *   on the email-OTP plugin's `/email-otp/verify-email` and `/email-otp/change-email` (typed in `@better-auth/core`
- *   `dist/types/init-options.d.mts`). Throwing from it leaves the address unverified.
+ *   `dist/types/init-options.d.mts`). Throwing from it leaves the address unverified. Plugin `init` receives the app's
+ *   options, so the plugin can see which function the app passed.
+ * - `/sign-in/email-otp` and `/email-otp/reset-password` mark an existing user's address verified with
+ *   `internalAdapter.updateUser(id, { emailVerified: true })` without calling `beforeEmailVerification`. That runs
+ *   `databaseHooks.user.update.before` with the endpoint context (route pattern in `path`, the request body in `body`).
  *
  * @module
  */
@@ -53,6 +57,7 @@ import {
   readCapped,
   socialProviderFor,
   validWhyUrl,
+  verifiedTokenPayload,
 } from "./internal.ts";
 
 /** What SignupBouncer says to do with a sign-up. In shadow mode this is always `"allow"`. */
@@ -199,11 +204,12 @@ export interface SignupBouncerOptions {
   checkOtherSignups?: boolean;
   /**
    * Report each email confirmation to SignupBouncer for the second look at challenged sign-ups (`POST /v1/confirm`):
-   * when a user clicks the link in Better Auth's verification email (`/verify-email`), the plugin sends the address,
-   * the User-Agent and, with an IP source, the IP, with `via: "link"`. Record only: it never refuses a confirmation,
-   * whatever the answer, because mail scanners open links too. It runs after Better Auth has marked the address
-   * verified, and waits at most 1 second (less with a lower `timeoutMs`). To refuse a confirmation on a page of your
-   * own with a button, use {@linkcode signupBouncerConfirm} instead. Default `false`.
+   * after each successful click on the link in Better Auth's verification email (`/verify-email`), the plugin sends the
+   * address, the User-Agent and, with an IP source, the IP, with `via: "link"`. A click on an address already verified
+   * is reported too, so the person's own click counts when a mail scanner opened the link first. Record only: it never
+   * refuses a confirmation, whatever the answer, because mail scanners open links too. It runs after Better Auth has
+   * answered, and waits at most 1 second (less with a lower `timeoutMs`). To refuse a confirmation on a page of your
+   * own with a button, use {@linkcode signupBouncerConfirm}. Default `false`.
    */
   secondLook?: boolean;
 }
@@ -620,13 +626,56 @@ export function confirmBlockMessage(result: ConfirmResult): string {
 }
 
 /**
- * Requests already reported by {@linkcode signupBouncerConfirm}, so the plugin's own `secondLook` report skips them.
- * Entries go with the request.
+ * Addresses {@linkcode signupBouncerConfirm} reported in the last few seconds (lower-cased, with when the entry
+ * expires), so the plugin's own `secondLook` report of the same `/verify-email` request skips them. Keyed by address
+ * rather than by request because a server-side `auth.api.verifyEmail` call has headers but no Request.
  */
-const confirmReported = new WeakSet<object>();
+const recentConfirms = new Map<string, number>();
+const RECENT_CONFIRM_MS = 10_000;
 
-// The email-OTP plugin's email change also runs beforeEmailVerification: a change of address, not a sign-up.
-const EMAIL_CHANGE = /\/email-otp\/change-email$/;
+function rememberConfirm(email: string): void {
+  const now = Date.now();
+  // Oldest first: drop expired entries so the map stays small.
+  for (const [key, expires] of recentConfirms) {
+    if (expires > now) break;
+    recentConfirms.delete(key);
+  }
+  const key = email.toLowerCase();
+  recentConfirms.delete(key);
+  recentConfirms.set(key, now + RECENT_CONFIRM_MS);
+}
+
+/** True, once, when {@linkcode signupBouncerConfirm} reported `email` in the last few seconds. */
+function takeConfirm(email: string): boolean {
+  const key = email.toLowerCase();
+  const expires = recentConfirms.get(key);
+  if (expires === undefined) return false;
+  recentConfirms.delete(key);
+  return expires > Date.now();
+}
+
+// The email-OTP plugin's email change also runs beforeEmailVerification: a change of address, not a sign-up. Better
+// Auth's router (better-call) refuses double slashes and accepts one trailing slash with
+// `advanced.skipTrailingSlashes`, so both spellings of the route end this way.
+const EMAIL_CHANGE = /\/email-otp\/change-email\/?$/;
+
+type ConfirmHookOptions = SignupBouncerOptions & { via: "button" | "code" };
+/** The options of each function {@linkcode signupBouncerConfirm} returned, so the plugin can recognise one. */
+const confirmHooks = new WeakMap<object, ConfirmHookOptions>();
+
+/** Reports a confirmation the person made themselves, and throws the refusal when a second look says block. */
+async function refuseIfBlocked(
+  options: ConfirmHookOptions,
+  input: { email: string; ip?: string; userAgent?: string; via: ConfirmVia },
+): Promise<void> {
+  const result = await confirmSignup(options, input);
+  if (result.action === "block") {
+    throw new APIError("FORBIDDEN", {
+      message: options.blockMessage ?? confirmBlockMessage(result),
+      code: "SIGNUP_BLOCKED",
+    });
+  }
+}
 
 function requestPath(request: Request | undefined): string {
   try {
@@ -658,6 +707,11 @@ function requestPath(request: Request | undefined): string {
  * });
  * ```
  *
+ * Better Auth's email OTP plugin also marks an address verified on `/sign-in/email-otp` and
+ * `/email-otp/reset-password` without calling `beforeEmailVerification`. When you pass the function this returns as
+ * `beforeEmailVerification` itself (not wrapped in a function of your own), the plugin recognises it and checks those
+ * two routes too, as typed codes, so a refused person cannot verify the address there instead.
+ *
  * @param options Your API key and settings, as for {@linkcode signupBouncer}, and `via`: how the person confirms.
  *   A `via` other than `"button"` or `"code"` reports `"link"` and never refuses.
  * @returns The function to pass as `beforeEmailVerification`.
@@ -665,22 +719,18 @@ function requestPath(request: Request | undefined): string {
 export function signupBouncerConfirm(
   options: SignupBouncerOptions & { via: "button" | "code" },
 ): (user: { email: string }, request?: Request) => Promise<void> {
-  return async (user, request) => {
+  const hook = async (user: { email: string }, request?: Request): Promise<void> => {
     if (EMAIL_CHANGE.test(requestPath(request))) return;
     const email = typeof user?.email === "string" && user.email !== "" ? user.email : undefined;
     const headers = request?.headers;
     const ip = ipFrom(options, request, headers);
     const userAgent = headers?.get("user-agent") ?? undefined;
     if (email === undefined || (!ip && !userAgent)) return;
-    if (request) confirmReported.add(request);
-    const result = await confirmSignup(options, { email, ip, userAgent, via: options.via });
-    if (result.action === "block") {
-      throw new APIError("FORBIDDEN", {
-        message: options.blockMessage ?? confirmBlockMessage(result),
-        code: "SIGNUP_BLOCKED",
-      });
-    }
+    rememberConfirm(email);
+    await refuseIfBlocked(options, { email, ip, userAgent, via: options.via });
   };
+  confirmHooks.set(hook, options);
+  return hook;
 }
 
 // The error a refused sign-up gets: HTTP 400 with { code, message } and, when the answer carries the "Why was this
@@ -694,6 +744,21 @@ const EMAIL_SIGNUP = "/sign-up/email";
 
 // Where Better Auth's GET /verify-email marks the address verified (the link in its verification email).
 const VERIFY_EMAIL = "/verify-email";
+// Email OTP routes that mark an existing user's address verified without calling beforeEmailVerification
+// (better-auth dist/plugins/email-otp/routes.mjs: signInEmailOTP through revokeUnprovenAccountAccess, and
+// resetPasswordEmailOTP), both after checking a code the person typed.
+const OTP_VERIFYING_PATHS = new Set(["/sign-in/email-otp", "/email-otp/reset-password"]);
+
+/** The parts of the `/verify-email` endpoint context the `secondLook` report reads. */
+type VerifyCtx = HookCtx & {
+  query?: { token?: unknown };
+  context?: {
+    secret?: unknown;
+    internalAdapter?: {
+      findUserByEmail?: (email: string) => Promise<{ user?: { email?: unknown; emailVerified?: unknown } } | null>;
+    };
+  };
+};
 
 function headersOf(ctx: HookCtx): Headers | undefined {
   return ctx?.headers ?? ctx?.request?.headers ?? undefined;
@@ -722,8 +787,11 @@ function ipFrom(
  * `user.create.before` database hook checks the user Better Auth is about to save. The second check makes a request
  * only when the saved address differs from the one already checked, for example when another hook rewrote it.
  *
- * With `secondLook: true`, `user.update.before` and `user.update.after` database hooks report each click on Better
- * Auth's verification link to SignupBouncer once the address is verified. They never refuse anything.
+ * With `secondLook: true`, an after hook on `/verify-email` reports each successful click on Better Auth's
+ * verification link, including a later click on an address already verified (when a mail scanner opened the link
+ * first). It never refuses anything. When the app's `beforeEmailVerification` is a function from
+ * {@linkcode signupBouncerConfirm}, a `user.update.before` database hook also checks the email OTP routes that verify
+ * an address without calling it.
  *
  * @param options Your API key and settings. See {@linkcode SignupBouncerOptions}.
  * @returns A Better Auth plugin with the id `"signupbouncer"`.
@@ -736,26 +804,31 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
   const requestKey = (ctx: HookCtx): object | undefined => ctx?.request ?? ctx?.headers ?? undefined;
 
   const ipOf = (ctx: HookCtx): string | undefined => ipFrom(options, ctx?.request ?? undefined, headersOf(ctx));
-  // Requests whose user update is Better Auth marking the address verified on /verify-email (seen by update.before),
-  // reported once the update is saved (update.after).
-  const verifying = new WeakSet<object>();
 
-  // secondLook: record only. The address is already verified when this runs, and the answer is never acted on.
-  const reportConfirmation = async (user: { email?: unknown; emailVerified?: unknown }, ctx: HookCtx) => {
-    const key = requestKey(ctx);
-    if (!key || !verifying.has(key)) return;
-    verifying.delete(key);
-    // Already reported by signupBouncerConfirm in beforeEmailVerification for this request.
-    if (confirmReported.has(key)) return;
-    if (user?.emailVerified !== true || typeof user.email !== "string" || user.email === "") return;
-    const ip = ipOf(ctx);
-    const userAgent = headersOf(ctx)?.get("user-agent") ?? undefined;
-    // The API needs the IP or the User-Agent; server code verifying without a request has neither.
-    if (!ip && !userAgent) return;
+  // secondLook: record only, after the endpoint has run. Each click on a valid link whose address is now verified is
+  // reported, also when the address was verified already: a mail scanner's GET may have verified it first, and then
+  // Better Auth answers the person's own click without updating the user, and SignupBouncer keeps nothing from a
+  // scanner's report. The answer is never acted on, and nothing here may throw.
+  const reportLinkClick = async (ctx: VerifyCtx): Promise<void> => {
     try {
+      // Only a token Better Auth itself accepted names the address; an email change (updateTo) is not a sign-up.
+      const payload = await verifiedTokenPayload(ctx?.query?.token, ctx?.context?.secret);
+      if (!payload || typeof payload.email !== "string" || payload.email === "" || payload.updateTo !== undefined) {
+        return;
+      }
+      // signupBouncerConfirm already reported this confirmation in beforeEmailVerification.
+      if (takeConfirm(payload.email)) return;
+      const ip = ipOf(ctx);
+      const userAgent = headersOf(ctx)?.get("user-agent") ?? undefined;
+      // The API needs the IP or the User-Agent; server code verifying without a request has neither.
+      if (!ip && !userAgent) return;
+      const found = await ctx?.context?.internalAdapter?.findUserByEmail?.(payload.email);
+      const user = found?.user;
+      // Not verified: the link failed, or signupBouncerConfirm refused it.
+      if (user?.emailVerified !== true || typeof user.email !== "string" || user.email === "") return;
       await confirmSignup(options, { email: user.email, ip, userAgent, via: "link" });
     } catch {
-      // confirmSignup never throws; a confirmation must never fail because of the report
+      // a confirmation never fails because of the report
     }
   };
 
@@ -793,10 +866,26 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
           }),
         },
       ],
+      ...(options.secondLook
+        ? {
+          after: [
+            {
+              matcher: (context: { path?: string }) => context.path === VERIFY_EMAIL,
+              handler: createAuthMiddleware(async (ctx) => {
+                await reportLinkClick(ctx as unknown as VerifyCtx);
+              }),
+            },
+          ],
+        }
+        : {}),
     },
     init: (authCtx?: unknown) => {
       // Read once, from the providers Better Auth resolved at start-up: they are fixed while it runs.
       const social = options.checkOtherSignups ? configuredSocialProviders(authCtx) : new Set<string>();
+      // The app's beforeEmailVerification, when it is a function from signupBouncerConfirm (passed directly).
+      const appHook = (authCtx as { options?: { emailVerification?: { beforeEmailVerification?: unknown } } } | null)
+        ?.options?.emailVerification?.beforeEmailVerification;
+      const guard = typeof appHook === "function" ? confirmHooks.get(appHook) : undefined;
       return {
         options: {
           databaseHooks: {
@@ -825,20 +914,21 @@ export function signupBouncer(options: SignupBouncerOptions): BetterAuthPlugin {
                   );
                 },
               },
-              ...(options.secondLook
+              ...(guard
                 ? {
                   update: {
-                    // deno-lint-ignore require-await
+                    // Email OTP sign-in and password reset verify an existing user's address without calling
+                    // beforeEmailVerification, so a person signupBouncerConfirm refused could verify there instead.
+                    // Each is a typed code: the same report and refusal, before the address is marked verified.
                     before: async (data: Record<string, unknown>, ctx?: HookCtx) => {
-                      // /verify-email marks the address verified with { emailVerified: true } alone. An email change
-                      // confirmed there also sets `email`: a change of address, not a sign-up's confirmation.
-                      if (ctx?.path !== VERIFY_EMAIL || typeof data !== "object" || data === null) return;
-                      if (data.emailVerified !== true || "email" in data) return;
-                      const key = requestKey(ctx);
-                      if (key) verifying.add(key);
-                    },
-                    after: async (user: { email?: unknown; emailVerified?: unknown }, ctx?: HookCtx) => {
-                      await reportConfirmation(user, ctx);
+                      if (typeof data !== "object" || data === null || data.emailVerified !== true) return;
+                      if (!ctx?.path || !OTP_VERIFYING_PATHS.has(ctx.path)) return;
+                      const raw = (ctx.body as { email?: unknown } | undefined)?.email;
+                      if (typeof raw !== "string" || raw === "") return;
+                      const ip = ipFrom(guard, ctx.request ?? undefined, headersOf(ctx));
+                      const userAgent = headersOf(ctx)?.get("user-agent") ?? undefined;
+                      if (!ip && !userAgent) return;
+                      await refuseIfBlocked(guard, { email: raw.toLowerCase(), ip, userAgent, via: "code" });
                     },
                   },
                 }

@@ -6,6 +6,7 @@
 import { assert, assertEquals } from "@std/assert";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
+import { emailOTP } from "better-auth/plugins";
 import {
   type CheckError,
   CONFIRM_TIMEOUT_MS,
@@ -22,6 +23,7 @@ const BASE = "http://localhost:3000";
 const UA = "Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0";
 const CHECK_ID = "chk_0123456789abcdef01234567";
 const BLOCK_MESSAGE = "We couldn't create your account. Please contact us if you need help.";
+const SECRET = "test-secret-test-secret-test-secret-0123";
 
 /** A body shaped like the real /v1/confirm answer (signupbouncer api/src/second_look.ts handleConfirm). */
 function confirmBody(
@@ -66,7 +68,7 @@ function makeAuth(
   const links: string[] = [];
   const auth = betterAuth({
     baseURL: BASE,
-    secret: "test-secret-test-secret-test-secret-0123",
+    secret: SECRET,
     database: memoryAdapter(db),
     emailAndPassword: { enabled: true, requireEmailVerification: true },
     emailVerification: {
@@ -223,42 +225,113 @@ Deno.test("secondLook off (the default): nothing is sent to /v1/confirm", async 
   }
 });
 
-Deno.test("secondLook: no request headers (server code verifying) and an email change send nothing", async () => {
-  const plugin = signupBouncer({ apiKey: "sb_live_test", baseUrl: "https://sb.test", secondLook: true });
-  // deno-lint-ignore no-explicit-any
-  const hooks = (await (plugin.init as any)({})).options.databaseHooks.user.update;
-  const m = mockApi(() => json(confirmBody("allow")));
+Deno.test("C2 secondLook: a mail scanner's click first, then the person's own click: both are reported", async () => {
+  const app = makeAuth({ secondLook: true });
+  const m = mockApi((call) =>
+    json(call.body.user_agent === UA ? confirmBody("allow") : confirmBody("allow", { second_look: false }))
+  );
   try {
-    const user = { email: "a@example.com", emailVerified: true };
-    // An email change confirmed on /verify-email sets the new address with emailVerified.
-    let ctx = { path: "/verify-email", headers: new Headers({ "user-agent": UA }) };
-    await hooks.before({ email: "new@example.com", emailVerified: true }, ctx);
-    await hooks.after({ ...user, email: "new@example.com" }, ctx);
-    // Another route, or an update that does not verify.
-    ctx = { path: "/update-user", headers: new Headers({ "user-agent": UA }) };
-    await hooks.before({ emailVerified: true }, ctx);
-    await hooks.after(user, ctx);
-    ctx = { path: "/verify-email", headers: new Headers({ "user-agent": UA }) };
-    await hooks.before({ name: "x" }, ctx);
-    await hooks.after(user, ctx);
-    // Neither an IP nor a User-Agent: the API would refuse the report.
-    ctx = { path: "/verify-email", headers: new Headers() };
-    await hooks.before({ emailVerified: true }, ctx);
-    await hooks.after(user, ctx);
-    // No endpoint context at all.
-    await hooks.before({ emailVerified: true }, null);
-    await hooks.after(user, null);
-    assertEquals(m.confirms().length, 0);
+    const scanner = { "user-agent": "Microsoft Office Existence Discovery", "x-real-ip": "40.94.0.1" };
+    await signUpAndConfirm(app, "person@example.com", scanner);
+    assert(verified(app.db, "person@example.com"));
+    // The address is verified now, so Better Auth answers the person's click without updating the user.
+    const again = await app.auth.handler(
+      new Request(app.links.at(-1)!, { headers: { "user-agent": UA, "x-real-ip": "198.51.100.4" } }),
+    );
+    await again.body?.cancel();
+    assert(again.status === 302 || again.status === 200, `status ${again.status}`);
+    assertEquals(m.confirms().map((c) => c.body), [
+      { via: "link", email: "person@example.com", ip: "40.94.0.1", user_agent: scanner["user-agent"] },
+      { via: "link", email: "person@example.com", ip: "198.51.100.4", user_agent: UA },
+    ]);
+  } finally {
+    m.restore();
+  }
+});
 
-    // The same hooks do report a real verification.
-    ctx = { path: "/verify-email", headers: new Headers({ "user-agent": UA }) };
-    await hooks.before({ emailVerified: true }, ctx);
-    await hooks.after(user, ctx);
-    assertEquals(m.confirms().map((c) => c.body), [{ via: "link", email: "a@example.com", user_agent: UA }]);
-    // The plugin adds no update hooks without secondLook.
-    const off = signupBouncer({ apiKey: "sb_live_test" });
-    // deno-lint-ignore no-explicit-any
-    assertEquals((await (off.init as any)({})).options.databaseHooks.user.update, undefined);
+/** An HS256 JWT like Better Auth's verification token, signed with `secret`. */
+async function signToken(payload: Record<string, unknown>, secret = SECRET): Promise<string> {
+  const b64 = (bytes: Uint8Array) =>
+    btoa(String.fromCharCode(...bytes)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+  const part = (o: unknown) => b64(new TextEncoder().encode(JSON.stringify(o)));
+  const unsigned = `${part({ alg: "HS256" })}.${part(payload)}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return `${unsigned}.${
+    b64(new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(unsigned))))
+  }`;
+}
+
+Deno.test("secondLook: forged, expired and email-change tokens, and server code without headers, send nothing", async () => {
+  const app = makeAuth({ secondLook: true });
+  const m = mockApi(() => json(confirmBody("allow")));
+  const headers = { "user-agent": UA, "x-real-ip": "198.51.100.4" };
+  try {
+    await signUpAndConfirm(app, "known@example.com", headers);
+    assertEquals(m.confirms().length, 1);
+    const exp = Math.floor(Date.now() / 1000) + 3600;
+    // A token made with the app's secret is one Better Auth accepts too: reported (the address is verified).
+    const crafted = await signToken({ email: "known@example.com", exp });
+    const ok = await app.auth.handler(new Request(`${BASE}/api/auth/verify-email?token=${crafted}`, { headers }));
+    await ok.body?.cancel();
+    assertEquals(m.confirms().length, 2);
+    // Server code verifying a valid token without request headers: no IP or User-Agent to send.
+    const valid = new URL(app.links.at(-1)!).searchParams.get("token")!;
+    await app.auth.api.verifyEmail({ query: { token: valid } });
+    assertEquals(m.confirms().length, 2);
+    // The same token with headers is reported (an address already verified still counts).
+    await app.auth.api.verifyEmail({ query: { token: valid }, headers: new Headers(headers) });
+    assertEquals(m.confirms().length, 3);
+    const tokens = [
+      await signToken({ email: "known@example.com", exp }, "not-the-secret-not-the-secret-not-the"),
+      await signToken({ email: "known@example.com", exp: Math.floor(Date.now() / 1000) - 10 }),
+      await signToken({ email: "known@example.com" }),
+      await signToken({ email: "known@example.com", updateTo: "new@example.com", exp }),
+      "not-a-token",
+    ];
+    for (const token of tokens) {
+      const res = await app.auth.handler(new Request(`${BASE}/api/auth/verify-email?token=${token}`, { headers }));
+      await res.body?.cancel();
+    }
+    // The email-change token above moved the user to new@example.com (Better Auth's own change), unreported.
+    assertEquals(app.db.user.map((u) => u.email), ["new@example.com"]);
+    assertEquals(m.confirms().length, 3);
+    // Off: the plugin adds no after hook at all.
+    assertEquals(signupBouncer({ apiKey: "sb_live_test" }).hooks?.after, undefined);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("C3 auth.api.verifyEmail with both mechanisms and getIp: one report, at most CONFIRM_TIMEOUT_MS", async () => {
+  const getIp = () => "198.51.100.9";
+  const opts = { apiKey: "sb_live_test", baseUrl: "https://sb.test", getIp, onError: () => {} };
+  const app = makeAuth({ ...opts, secondLook: true }, {
+    beforeEmailVerification: signupBouncerConfirm({ ...opts, via: "button" }),
+  });
+  const m = mockApi((c, s) => hang(c, s));
+  try {
+    const signedUp = await app.auth.handler(
+      new Request(`${BASE}/api/auth/sign-up/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: BASE },
+        body: JSON.stringify({ email: "server@example.com", password: "correct-horse-battery", name: "Test" }),
+      }),
+    );
+    await signedUp.body?.cancel();
+    for (let i = 0; i < 50 && app.links.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    const token = new URL(app.links.at(-1)!).searchParams.get("token")!;
+    const started = performance.now();
+    await app.auth.api.verifyEmail({ query: { token }, headers: new Headers({ "user-agent": UA }) });
+    const took = performance.now() - started;
+    assert(took < CONFIRM_TIMEOUT_MS + 500, `took ${took} ms`);
+    assert(verified(app.db, "server@example.com"));
+    assertEquals(m.confirms().map((c) => c.body.via), ["button"]);
   } finally {
     m.restore();
   }
@@ -350,6 +423,131 @@ Deno.test("signupBouncerConfirm: email OTP sends via code; an email change throu
     assertEquals(m.confirms().map((c) => c.body), [{ via: "code", email: "otp@example.com", user_agent: UA }]);
   } finally {
     m.restore();
+  }
+});
+
+/** A Better Auth app with the email OTP plugin; the codes it sends are kept by type. */
+function makeOtpAuth(
+  beforeEmailVerification: ((user: { email: string }, request?: Request) => Promise<void>) | undefined,
+  extra: { requireEmailVerification?: boolean; skipTrailingSlashes?: boolean; secondLook?: boolean } = {},
+) {
+  const db = { user: [], session: [], account: [], verification: [] } as Record<string, Record<string, unknown>[]>;
+  const otps: Record<string, string> = {};
+  const auth = betterAuth({
+    baseURL: BASE,
+    secret: SECRET,
+    database: memoryAdapter(db),
+    emailAndPassword: { enabled: true, requireEmailVerification: extra.requireEmailVerification ?? true },
+    emailVerification: beforeEmailVerification ? { beforeEmailVerification } : {},
+    advanced: { skipTrailingSlashes: extra.skipTrailingSlashes ?? false },
+    rateLimit: { enabled: false },
+    telemetry: { enabled: false },
+    plugins: [
+      emailOTP({
+        changeEmail: { enabled: true },
+        sendVerificationOTP: ({ otp, type }) => {
+          otps[type] = otp;
+          return Promise.resolve();
+        },
+      }),
+      signupBouncer({ apiKey: "sb_live_test", baseUrl: "https://sb.test", secondLook: extra.secondLook }),
+    ],
+  });
+  const post = async (path: string, body: Record<string, unknown>, cookie = "") => {
+    const res = await auth.handler(
+      new Request(`${BASE}/api/auth${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: BASE, "user-agent": UA, ...(cookie ? { cookie } : {}) },
+        body: JSON.stringify(body),
+      }),
+    );
+    const cookies = res.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    await res.body?.cancel();
+    return { status: res.status, cookies };
+  };
+  const signUp = (email: string) => post("/sign-up/email", { email, password: "correct-horse-battery", name: "T" });
+  return { auth, db, otps, post, signUp };
+}
+
+const CODE_OPTS = { apiKey: "sb_live_test", baseUrl: "https://sb.test", onError: () => {} };
+
+Deno.test("C1 signupBouncerConfirm: a refused person cannot verify through email OTP sign-in or password reset", async () => {
+  const app = makeOtpAuth(signupBouncerConfirm({ ...CODE_OPTS, via: "code" }));
+  const m = mockApi(() => json(confirmBody("block")));
+  const email = "farm@example.com";
+  try {
+    assertEquals((await app.signUp(email)).status, 200);
+    await app.post("/email-otp/send-verification-otp", { email, type: "email-verification" });
+    assertEquals(
+      (await app.post("/email-otp/verify-email", { email, otp: app.otps["email-verification"] })).status,
+      403,
+    );
+    // Email OTP sign-in verifies an unverified user without calling beforeEmailVerification.
+    await app.post("/email-otp/send-verification-otp", { email, type: "sign-in" });
+    const signIn = await app.post("/sign-in/email-otp", { email: "Farm@Example.com", otp: app.otps["sign-in"] });
+    assertEquals(signIn.status, 403);
+    assertEquals(signIn.cookies.includes("session_token"), false);
+    // So does password reset by email OTP.
+    await app.post("/email-otp/send-verification-otp", { email, type: "forget-password" });
+    const reset = await app.post("/email-otp/reset-password", {
+      email,
+      otp: app.otps["forget-password"],
+      password: "another-horse-battery",
+    });
+    assertEquals(reset.status, 403);
+    assertEquals(verified(app.db, email), false);
+    assertEquals(app.db.session.length, 0);
+    assertEquals(m.confirms().map((c) => [c.body.via, c.body.email]), [
+      ["code", email],
+      ["code", email],
+      ["code", email],
+    ]);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("C1 email OTP sign-in: allowed when the second look allows; nothing sent without signupBouncerConfirm", async () => {
+  for (const withHook of [true, false]) {
+    const app = makeOtpAuth(withHook ? signupBouncerConfirm({ ...CODE_OPTS, via: "code" }) : undefined, {
+      secondLook: true,
+    });
+    const m = mockApi(() => json(confirmBody("allow")));
+    const email = `otp-${withHook}@example.com`;
+    try {
+      assertEquals((await app.signUp(email)).status, 200);
+      await app.post("/email-otp/send-verification-otp", { email, type: "sign-in" });
+      const signIn = await app.post("/sign-in/email-otp", { email, otp: app.otps["sign-in"] });
+      assertEquals(signIn.status, 200, `withHook: ${withHook}`);
+      assert(verified(app.db, email));
+      assertEquals(m.confirms().map((c) => c.body.via), withHook ? ["code"] : [], `withHook: ${withHook}`);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+Deno.test("S1 signupBouncerConfirm: an email change through email OTP sends nothing, with a trailing slash too", async () => {
+  for (const path of ["/email-otp/change-email", "/email-otp/change-email/"]) {
+    const app = makeOtpAuth(signupBouncerConfirm({ ...CODE_OPTS, via: "code" }), {
+      requireEmailVerification: false,
+      skipTrailingSlashes: true,
+    });
+    const m = mockApi(() => json(confirmBody("block")));
+    try {
+      const { cookies } = await app.signUp("old@example.com");
+      assert(cookies.includes("session_token"), "signed in after sign-up");
+      assertEquals(
+        (await app.post("/email-otp/request-email-change", { newEmail: "new@example.com" }, cookies)).status,
+        200,
+      );
+      const changed = await app.post(path, { newEmail: "new@example.com", otp: app.otps["change-email"] }, cookies);
+      assertEquals(changed.status, 200, path);
+      assertEquals(app.db.user.map((u) => u.email), ["new@example.com"], path);
+      assertEquals(m.confirms().length, 0, path);
+    } finally {
+      m.restore();
+    }
   }
 });
 

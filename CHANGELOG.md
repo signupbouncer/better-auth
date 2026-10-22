@@ -7,15 +7,19 @@ sign-up gets SignupBouncer's second look at email confirmation. It only records:
 is off until you set `secondLook: true`. Apps whose verification email opens a page of their own with a button, or that
 use email OTP codes, can let the second look refuse a confirmation with `signupBouncerConfirm`.
 
-- **`secondLook: true`** (default `false`, so upgrading sends nothing new). After Better Auth marks an address verified
-  on `GET /verify-email`, the plugin sends `POST /v1/confirm` with the address, the User-Agent, the client IP when you
-  configure a source for it, and `via: "link"`. It never acts on the answer, because mail scanners open links too. The
-  click waits at most 1 second (`CONFIRM_TIMEOUT_MS`, or `timeoutMs` when lower), and any failure lets it through. An
-  email change confirmed through the same link sends nothing.
+- **`secondLook: true`** (default `false`, so upgrading sends nothing new). After each successful click on Better Auth's
+  verification link (`GET /verify-email`), the plugin sends `POST /v1/confirm` with the address, the User-Agent, the
+  client IP when you configure a source for it, and `via: "link"`. A click on an address already verified counts too, so
+  the person's own click is reported when a mail scanner opened the link first. It never acts on the answer, because
+  mail scanners open links too. The click waits at most 1 second (`CONFIRM_TIMEOUT_MS`, or `timeoutMs` when lower), and
+  any failure lets it through. An email change, or a token Better Auth would refuse, sends nothing.
 - **`signupBouncerConfirm({ ...options, via: "button" | "code" })`**, for Better Auth's
   `emailVerification.beforeEmailVerification`. When a complete enforce-mode answer from a second look says block, it
   throws HTTP 403 `{ code: "SIGNUP_BLOCKED", message }` and the address stays unverified. Shadow mode, a check with no
-  second look, a timeout and any error let the confirmation through. It skips the email OTP plugin's email change.
+  second look, a timeout and any error let the confirmation through. It skips the email OTP plugin's email change (with
+  or without a trailing slash). Passed directly as `beforeEmailVerification`, the plugin recognises it and also checks
+  email OTP sign-in and password reset, which verify an address without calling `beforeEmailVerification`. With
+  `secondLook: true` as well, each confirmation is reported once, server-side `auth.api` calls included.
 - **`confirmSignup(options, input)`** and **`confirmBlockMessage(result)`**: the same report from your own routes. It
   never throws; with `via: "link"` (the default) its `action` is always `"allow"`.
 - **`onError` for reports.** A failed report calls `onError` with `call: "confirm"`, and the default warning says

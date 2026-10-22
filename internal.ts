@@ -200,6 +200,46 @@ export function firstStandsCode(text: string): "unknown_check" | "check_expired"
   }
 }
 
+function base64UrlBytes(s: string): Uint8Array<ArrayBuffer> {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/**
+ * The payload of a Better Auth email verification token (`/verify-email?token=...`), only when it is an HS256 JWT
+ * signed with `secret` and its `exp` has not passed; otherwise `undefined`. Never throws. Better Auth signs these
+ * tokens with `ctx.context.secret` and checks them the same way (`createEmailVerificationToken` and `verifyEmail` in
+ * better-auth `dist/api/routes/email-verification.mjs`, checked against 1.7.0, 1.7.7 and 1.7.11), so a payload that
+ * passes here is one Better Auth accepted: a forged or expired token never names an address the plugin reports.
+ */
+export async function verifiedTokenPayload(
+  token: unknown,
+  secret: unknown,
+  now: number = Date.now(),
+): Promise<Record<string, unknown> | undefined> {
+  if (typeof token !== "string" || token.length > 8192 || typeof secret !== "string" || secret === "") return undefined;
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts.some((p) => !/^[A-Za-z0-9_-]+$/.test(p))) return undefined;
+  try {
+    const header: unknown = JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[0])));
+    if (!isObj(header) || header.alg !== "HS256") return undefined;
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const signed = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+    if (!await crypto.subtle.verify("HMAC", key, base64UrlBytes(parts[2]), signed)) return undefined;
+    const payload: unknown = JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[1])));
+    if (!isObj(payload) || !isNum(payload.exp) || payload.exp * 1000 <= now) return undefined;
+    return payload;
+  } catch {
+    return undefined;
+  }
+}
+
 // A subset of what the API accepts (letters, digits, . _ : -; 40 at most) that must start with a letter or digit, so a
 // route pattern such as ":id" is never sent as a provider.
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,39}$/;
