@@ -91,6 +91,40 @@ export function isCompleteAnswer(v: unknown): boolean {
   return action === "allow" || (mode === "enforce" && v.quota_exceeded === false && action === verdict);
 }
 
+const CONFIRM_ACTIONS = new Set<string>(["allow", "block"]);
+
+/**
+ * True only for a complete `/v1/confirm` answer: every field the API always sends with a 200, with the right type. Our
+ * own error answer (`"error": "internal_error"`, an allow with `check_id` and `first` possibly `null`) counts as one.
+ * Anything partial or mistyped counts as a failed report (`onError` "bad_response"), and the confirmation goes through.
+ */
+export function isCompleteConfirmAnswer(v: unknown): v is Record<string, unknown> {
+  if (!isObj(v)) return false;
+  const { action, verdict, mode, reasons, shadow, first } = v;
+  if (!isStr(action) || !CONFIRM_ACTIONS.has(action) || !isStr(verdict) || !CONFIRM_ACTIONS.has(verdict)) return false;
+  if (mode !== "shadow" && mode !== "enforce") return false;
+  if (!isNum(v.score) || !isStrOrNull(v.check_id) || !isNum(v.latency_ms)) return false;
+  if (typeof v.second_look !== "boolean" || typeof v.replayed !== "boolean") return false;
+  if (first !== null && !(isObj(first) && isStr(first.verdict) && ACTIONS.has(first.verdict) && isNum(first.score))) {
+    return false;
+  }
+  const reasonOk = (r: unknown) => isObj(r) && isStr(r.code) && isStr(r.detail) && isNum(r.points) && isStr(r.tier);
+  if (!Array.isArray(reasons) || !reasons.every(reasonOk)) return false;
+  const shadowOk = (r: unknown) => isObj(r) && isStr(r.code) && isStr(r.detail) && isStr(r.tier);
+  return Array.isArray(shadow) && shadow.every(shadowOk);
+}
+
+/**
+ * True only for an answer that refuses a confirmation: complete, `action` and `verdict` both `"block"`, enforce mode,
+ * from a second look (`second_look: true`) of a known check, and not our error answer. A check that got no second look
+ * (`second_look: false`, the first answer standing) never refuses one, the same rule as SignupBouncer's fetch helper
+ * (`confirmationRefusal` in the SignupBouncer repo).
+ */
+export function isConfirmBlock(v: unknown): boolean {
+  return isCompleteConfirmAnswer(v) && v.action === "block" && v.verdict === "block" && v.mode === "enforce" &&
+    v.second_look === true && isStr(v.check_id) && !("error" in v);
+}
+
 /** Why {@link readCapped} gave up. */
 export type ReadFailure = "too_large" | "aborted";
 
@@ -150,6 +184,60 @@ export async function readCapped(
     offset += c.byteLength;
   }
   return new TextDecoder().decode(all);
+}
+
+/**
+ * The `error` code of a `/v1/confirm` 404 or 410 body that means "no second look, the first answer stands"
+ * (`unknown_check`, `check_expired`), or `undefined` for anything else. Those two are an ordinary outcome, such as a
+ * user who signed up before the plugin was installed or confirmed after 72 hours, not a failure to report.
+ */
+export function firstStandsCode(text: string): "unknown_check" | "check_expired" | undefined {
+  try {
+    const error = (JSON.parse(text) as { error?: unknown } | null)?.error;
+    return error === "unknown_check" || error === "check_expired" ? error : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function base64UrlBytes(s: string): Uint8Array<ArrayBuffer> {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/**
+ * The payload of a Better Auth email verification token (`/verify-email?token=...`), only when it is an HS256 JWT
+ * signed with `secret` and its `exp` has not passed; otherwise `undefined`. Never throws. Better Auth signs these
+ * tokens with `ctx.context.secret` and checks them the same way (`createEmailVerificationToken` and `verifyEmail` in
+ * better-auth `dist/api/routes/email-verification.mjs`, checked against 1.7.0, 1.7.7 and 1.7.11), so a payload that
+ * passes here is one Better Auth accepted: a forged or expired token never names an address the plugin reports.
+ */
+export async function verifiedTokenPayload(
+  token: unknown,
+  secret: unknown,
+  now: number = Date.now(),
+): Promise<Record<string, unknown> | undefined> {
+  if (typeof token !== "string" || token.length > 8192 || typeof secret !== "string" || secret === "") return undefined;
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts.some((p) => !/^[A-Za-z0-9_-]+$/.test(p))) return undefined;
+  try {
+    const header: unknown = JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[0])));
+    if (!isObj(header) || header.alg !== "HS256") return undefined;
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const signed = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+    if (!await crypto.subtle.verify("HMAC", key, base64UrlBytes(parts[2]), signed)) return undefined;
+    const payload: unknown = JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[1])));
+    if (!isObj(payload) || !isNum(payload.exp) || payload.exp * 1000 <= now) return undefined;
+    return payload;
+  } catch {
+    return undefined;
+  }
 }
 
 // A subset of what the API accepts (letters, digits, . _ : -; 40 at most) that must start with a letter or digit, so a

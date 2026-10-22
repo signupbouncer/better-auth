@@ -126,6 +126,8 @@ way. It never shows your settings or your checks, and the link carries the domai
   `challenge: "block"`, because Better Auth has no captcha step to send it to.
 - With `checkOtherSignups: true`, also checks users created by OAuth, magic link, email OTP and other plugins (see
   below).
+- With `secondLook: true`, tells SignupBouncer when a user clicks the link in Better Auth's verification email, for the
+  second look at challenged sign-ups. It never refuses a confirmation (see "Second look at email confirmation").
 
 It leaves alone sign-ins, password resets, sessions and anything else that does not create a user. It stores nothing
 between requests.
@@ -182,6 +184,7 @@ ignored.
 | `getIp`             | none                                    | `(request, headers) => ip`: your own IP lookup, used instead of `ipHeader`.                 |
 | `onError`           | one `console.warn` line                 | Called with `{ reason, status? }` when a check fails. The sign-up is still allowed.         |
 | `checkOtherSignups` | `false`                                 | Also check users created by OAuth, magic link, email OTP and other plugins (see below).     |
+| `secondLook`        | `false`                                 | Report clicks on the verification link for a second look. Never refuses. See below.         |
 
 ### Which app the checks go to
 
@@ -272,6 +275,105 @@ never carries the "Why was this refused?" link. Show `error_description` on that
 Google, a generic OAuth provider and magic link. On other redirect flows the error the user sees depends on the flow and
 your Better Auth version.
 
+### Second look at email confirmation
+
+When SignupBouncer marks a sign-up challenge and the plugin lets it through, the person still has to confirm their
+address. SignupBouncer can look at the sign-up again at that moment: how many sign-ups came from the same network since
+the check and, when the person presses a button or types a code, where they confirmed from and with what. It is part of
+the original check, on every plan, and never charged as another check. API details:
+https://signupbouncer.com/docs#confirm.
+
+Turn it on with `secondLook: true`:
+
+```ts
+signupBouncer({
+  apiKey: process.env.SIGNUPBOUNCER_API_KEY!,
+  ipHeader: "cf-connecting-ip",
+  secondLook: true,
+});
+```
+
+- After each successful click on the link in Better Auth's verification email (`GET /verify-email`), the plugin sends
+  SignupBouncer the address, the User-Agent and, when you configure a source for it, the client IP, with `via: "link"`.
+  It runs once Better Auth has answered the click and the address is verified.
+- A click on an address that is already verified is reported too. A mail scanner that opens the link first verifies the
+  address in Better Auth, and SignupBouncer keeps nothing from a scanner's report, so the person's own click later is
+  the one that gets the second look.
+- **Record only.** The plugin never refuses a link confirmation, whatever the answer. Mail scanners open links in emails
+  before people do, so SignupBouncer does not score that click's IP or browser, and the plugin only records the second
+  look.
+- The click waits at most 1 second for the whole report, the plugin's lookup of the user included (`timeoutMs`, when
+  lower). SignupBouncer answers within half a second. A timeout, a network error, a non-2xx answer or an unreadable
+  answer calls `onError` with `call: "confirm"`. Without `onError` the plugin writes one `console.warn` line, such as
+  `[signupbouncer] confirmation report failed (timeout), confirmation allowed.` Nothing changes for the user.
+- An address with no sign-up check in the last 72 hours (such as a user who signed up before you installed the plugin)
+  gets no second look and calls no `onError`. Only a challenged sign-up gets a second look; any other keeps its first
+  answer.
+- Nothing is sent for an email change confirmed through the same link, for a link whose token Better Auth would refuse
+  (expired, or not signed with your secret), or when server code verifies an address without a request.
+- It is off by default, so upgrading the plugin sends nothing new until you turn it on.
+
+SignupBouncer keeps the confirming IP's network (its /24 or /48 and ASN, not the address), whether the browser looked
+scripted, how the person confirmed, how long after the check it came, and the answer. They are deleted with the check.
+
+#### Refusing a confirmation from a page of your own
+
+A second look can refuse a confirmation only when the person's own action confirms it: a button on a page of yours, or a
+code they type. Make your verification email link to your own page (not to Better Auth's `/verify-email`), and have its
+button call `authClient.verifyEmail({ query: { token } })`. Then pass `signupBouncerConfirm` as Better Auth's
+`beforeEmailVerification`:
+
+```ts
+import { signupBouncer, signupBouncerConfirm } from "@signupbouncer/better-auth";
+
+const sb = { apiKey: process.env.SIGNUPBOUNCER_API_KEY!, ipHeader: "cf-connecting-ip" };
+
+export const auth = betterAuth({
+  emailAndPassword: { enabled: true, requireEmailVerification: true },
+  emailVerification: {
+    sendVerificationEmail: async ({ user, token }) => {
+      // Link to your own page, such as https://example.com/confirm?token=..., whose button calls
+      // authClient.verifyEmail({ query: { token } }).
+    },
+    beforeEmailVerification: signupBouncerConfirm({ ...sb, via: "button" }),
+  },
+  plugins: [signupBouncer(sb)],
+});
+```
+
+- Better Auth runs it just before it marks the address verified. When SignupBouncer's second look says block, it throws
+  HTTP 403 with `{ code: "SIGNUP_BLOCKED", message }`, and the address stays unverified. With
+  `requireEmailVerification`, the person cannot sign in. `authClient.verifyEmail()` returns that body as `error`: show
+  `error.message` on your page.
+- The message is the one from the Rules tab of your dashboard, or `blockMessage` when you set it. Without either it is
+  "We couldn't confirm your email address. Please contact us if you need help."
+- Only a complete enforce-mode block from a second look refuses. In shadow mode, for a sign-up that got no second look,
+  and on any failure or timeout, the confirmation goes through. A second click gets the same answer as the first.
+- With Better Auth's email OTP plugin, use `via: "code"`: the person types the code from the email. An email change
+  through email OTP sends nothing.
+- The email OTP plugin also marks an address verified on email OTP sign-in (`/sign-in/email-otp`) and password reset
+  (`/email-otp/reset-password`), without calling `beforeEmailVerification`. When you pass the function
+  `signupBouncerConfirm` returns as `beforeEmailVerification` itself, the plugin recognises it and checks those two
+  routes too, as typed codes: a refused person gets the same 403 there and the address stays unverified. Before that
+  check, Better Auth has already removed the unverified account's password and sessions (its own rule when an address is
+  first proven on those routes), and on password reset it has already saved the new password. Two email OTP sign-ins at
+  once are covered too: the second one, which Better Auth lets create a session without marking the address verified,
+  gets the same check before its session is created. If you wrap `signupBouncerConfirm` in a function of your own, the
+  plugin cannot recognise it: those two routes and server-side calls (below) are not checked, and with
+  `secondLook: true` a confirmation is reported twice.
+- Server code that confirms through Better Auth's server API, such as a server action calling
+  `auth.api.verifyEmail({ query: { token }, headers })` or `auth.api.verifyEmailOTP({ body, headers })`, is checked with
+  the headers you pass. Better Auth gives `beforeEmailVerification` no Request for those calls, so the plugin keeps each
+  call's route and headers for `signupBouncerConfirm` to read; this needs the plugin to recognise it, as above. Pass the
+  incoming request's headers, or the client IP and User-Agent cannot be sent.
+- Magic link and OAuth account linking also mark an address verified without `beforeEmailVerification`, and the plugin
+  does not refuse there: a magic link is a link click, which a mail scanner can make, and with OAuth the provider
+  verified the address, not your confirmation email.
+- Use `via: "button"` only when every verification goes through your button page. If the emailed link goes straight to
+  `/verify-email`, the request is the click on the link, which a mail scanner can make: use `secondLook: true` instead.
+- With `secondLook: true` as well, each confirmation is reported once, by `signupBouncerConfirm`. Several Better Auth
+  apps in one process each keep their own record of this.
+
 ### Using the check directly
 
 `checkSignup(options, { email, ip, userAgent, authProvider, emailVerified })` is exported too. It returns
@@ -279,6 +381,10 @@ your Better Auth version.
 email exactly as your app saves it. For an OAuth or SSO sign-up, pass the provider id as `authProvider` and your auth
 library's own verified flag as `emailVerified`. `shouldBlock(result, challenge)` turns the result into a yes or no.
 `blockMessage(result)` gives the message to show and `whyUrl(result)` the link, or `null` without one.
+
+`confirmSignup(options, { email, checkId, ip, userAgent, via })` reports a confirmation from your own route the same
+way. It returns `{ ok, action, response | error }`, never throws, and `action` is `"block"` only for a `"button"` or
+`"code"` confirmation that a second look refused. `confirmBlockMessage(result)` gives the message to show.
 
 ## Better Auth APIs this plugin uses
 
@@ -292,6 +398,21 @@ Checked on 14 Oct 2026 against the live docs and `better-auth` 1.7.0 and 1.7.7 f
   `{ options: { databaseHooks } }` from its `init` function. The `BetterAuthPlugin` type includes that, and the built-in
   admin plugin uses it, but the plugin docs page does not describe it. Better Auth passes the endpoint context as the
   hook's second argument, with the route pattern in `path` (`/callback/:id`) and the provider in `params`.
+
+For the second look, checked on 22 Oct 2026 against the source of `better-auth` 1.7.0, 1.7.7 and 1.7.11 from npm:
+
+- `GET /verify-email` checks its token (an HS256 JWT signed with your Better Auth secret), then marks the address
+  verified, or answers without an update when it is verified already (`dist/api/routes/email-verification.mjs`). Plugin
+  `hooks.after` run after every endpoint, a thrown redirect included (`dist/api/dispatch.mjs`). `secondLook` is an after
+  hook on `/verify-email`: it checks the token the same way, skips an email change (`updateTo` in the token), and
+  reports when the address is verified.
+- `emailVerification.beforeEmailVerification(user, request)` runs just before that update, on `/verify-email` and on the
+  email OTP plugin's `/email-otp/verify-email` and `/email-otp/change-email`. Throwing from it leaves the address
+  unverified.
+- `/sign-in/email-otp` and `/email-otp/reset-password` mark an existing user's address verified with
+  `internalAdapter.updateUser(id, { emailVerified: true })` (`dist/plugins/email-otp/routes.mjs`,
+  `dist/db/revoke-unproven-account-access.mjs`), which runs `databaseHooks.user.update.before` with the endpoint
+  context. The plugin reads the app's `beforeEmailVerification` from the options Better Auth passes to its `init`.
 
 ## Development
 
