@@ -302,9 +302,9 @@ signupBouncer({
 - **Record only.** The plugin never refuses a link confirmation, whatever the answer. Mail scanners open links in emails
   before people do, so SignupBouncer does not score that click's IP or browser, and the plugin only records the second
   look.
-- The click waits for the answer at most 1 second (`timeoutMs`, when lower). SignupBouncer answers within half a second.
-  A timeout, a network error, a non-2xx answer or an unreadable answer calls `onError` with `call: "confirm"`. Without
-  `onError` the plugin writes one `console.warn` line, such as
+- The click waits at most 1 second for the whole report, the plugin's lookup of the user included (`timeoutMs`, when
+  lower). SignupBouncer answers within half a second. A timeout, a network error, a non-2xx answer or an unreadable
+  answer calls `onError` with `call: "confirm"`. Without `onError` the plugin writes one `console.warn` line, such as
   `[signupbouncer] confirmation report failed (timeout), confirmation allowed.` Nothing changes for the user.
 - An address with no sign-up check in the last 72 hours (such as a user who signed up before you installed the plugin)
   gets no second look and calls no `onError`. Only a challenged sign-up gets a second look; any other keeps its first
@@ -356,14 +356,23 @@ export const auth = betterAuth({
   `signupBouncerConfirm` returns as `beforeEmailVerification` itself, the plugin recognises it and checks those two
   routes too, as typed codes: a refused person gets the same 403 there and the address stays unverified. Before that
   check, Better Auth has already removed the unverified account's password and sessions (its own rule when an address is
-  first proven on those routes), and on password reset it has already saved the new password. If you wrap
-  `signupBouncerConfirm` in a function of your own, the plugin cannot recognise it and those two routes are not checked.
+  first proven on those routes), and on password reset it has already saved the new password. Two email OTP sign-ins at
+  once are covered too: the second one, which Better Auth lets create a session without marking the address verified,
+  gets the same check before its session is created. If you wrap `signupBouncerConfirm` in a function of your own, the
+  plugin cannot recognise it: those two routes and server-side calls (below) are not checked, and with
+  `secondLook: true` a confirmation is reported twice.
+- Server code that confirms through Better Auth's server API, such as a server action calling
+  `auth.api.verifyEmail({ query: { token }, headers })` or `auth.api.verifyEmailOTP({ body, headers })`, is checked with
+  the headers you pass. Better Auth gives `beforeEmailVerification` no Request for those calls, so the plugin keeps each
+  call's route and headers for `signupBouncerConfirm` to read; this needs the plugin to recognise it, as above. Pass the
+  incoming request's headers, or the client IP and User-Agent cannot be sent.
 - Magic link and OAuth account linking also mark an address verified without `beforeEmailVerification`, and the plugin
   does not refuse there: a magic link is a link click, which a mail scanner can make, and with OAuth the provider
   verified the address, not your confirmation email.
 - Use `via: "button"` only when every verification goes through your button page. If the emailed link goes straight to
   `/verify-email`, the request is the click on the link, which a mail scanner can make: use `secondLook: true` instead.
-- With `secondLook: true` as well, each confirmation is reported once, by `signupBouncerConfirm`.
+- With `secondLook: true` as well, each confirmation is reported once, by `signupBouncerConfirm`. Several Better Auth
+  apps in one process each keep their own record of this.
 
 ### Using the check directly
 

@@ -60,16 +60,19 @@ function mockApi(onConfirm: ConfirmHandler) {
   return { ...m, confirms: () => m.calls.filter((c) => c.url.endsWith("/v1/confirm")) };
 }
 
+type Db = Record<string, Record<string, unknown>[]>;
+
 function makeAuth(
   opts: Partial<SignupBouncerOptions> = {},
   verification: { beforeEmailVerification?: (user: { email: string }, request?: Request) => Promise<void> } = {},
+  adapter: (db: Db) => ReturnType<typeof memoryAdapter> = memoryAdapter,
 ) {
-  const db = { user: [], session: [], account: [], verification: [] } as Record<string, Record<string, unknown>[]>;
+  const db = { user: [], session: [], account: [], verification: [] } as Db;
   const links: string[] = [];
   const auth = betterAuth({
     baseURL: BASE,
     secret: SECRET,
-    database: memoryAdapter(db),
+    database: adapter(db),
     emailAndPassword: { enabled: true, requireEmailVerification: true },
     emailVerification: {
       sendOnSignUp: true,
@@ -429,14 +432,19 @@ Deno.test("signupBouncerConfirm: email OTP sends via code; an email change throu
 /** A Better Auth app with the email OTP plugin; the codes it sends are kept by type. */
 function makeOtpAuth(
   beforeEmailVerification: ((user: { email: string }, request?: Request) => Promise<void>) | undefined,
-  extra: { requireEmailVerification?: boolean; skipTrailingSlashes?: boolean; secondLook?: boolean } = {},
+  extra: {
+    requireEmailVerification?: boolean;
+    skipTrailingSlashes?: boolean;
+    secondLook?: boolean;
+    adapter?: (db: Db) => ReturnType<typeof memoryAdapter>;
+  } = {},
 ) {
-  const db = { user: [], session: [], account: [], verification: [] } as Record<string, Record<string, unknown>[]>;
+  const db = { user: [], session: [], account: [], verification: [] } as Db;
   const otps: Record<string, string> = {};
   const auth = betterAuth({
     baseURL: BASE,
     secret: SECRET,
-    database: memoryAdapter(db),
+    database: (extra.adapter ?? memoryAdapter)(db),
     emailAndPassword: { enabled: true, requireEmailVerification: extra.requireEmailVerification ?? true },
     emailVerification: beforeEmailVerification ? { beforeEmailVerification } : {},
     advanced: { skipTrailingSlashes: extra.skipTrailingSlashes ?? false },
@@ -548,6 +556,192 @@ Deno.test("S1 signupBouncerConfirm: an email change through email OTP sends noth
     } finally {
       m.restore();
     }
+  }
+});
+
+/**
+ * The memory adapter, with what a real database does that it does not: a verification row's id is unique (Better
+ * Auth's account clean-up lock relies on it), and user lookups can be made to stall.
+ */
+function realisticAdapter(control: { stallUsers?: boolean } = {}) {
+  return (db: Db) => {
+    const base = memoryAdapter(db) as unknown as (options: unknown) => Record<string, unknown>;
+    return ((options: unknown) => {
+      const adapter = base(options);
+      const create = adapter.create as (args: { model: string; data: { id?: unknown } }) => Promise<unknown>;
+      const findOne = adapter.findOne as (args: { model: string }) => Promise<unknown>;
+      adapter.create = (args: { model: string; data: { id?: unknown } }) => {
+        if (args.model === "verification" && db.verification.some((r) => r.id === args.data.id)) {
+          return Promise.reject(new Error("UNIQUE constraint failed: verification.id"));
+        }
+        return create(args);
+      };
+      adapter.findOne = (args: { model: string }) =>
+        control.stallUsers && args.model === "user" ? new Promise(() => {}) : findOne(args);
+      return adapter;
+    }) as unknown as ReturnType<typeof memoryAdapter>;
+  };
+}
+
+/** Signs up without clicking, and returns the token from the emailed link. */
+async function signUpForToken(app: ReturnType<typeof makeAuth>, email: string): Promise<string> {
+  const signedUp = await app.auth.handler(
+    new Request(`${BASE}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: BASE },
+      body: JSON.stringify({ email, password: "correct-horse-battery", name: "Test" }),
+    }),
+  );
+  await signedUp.body?.cancel();
+  for (let i = 0; i < 50 && app.links.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  return new URL(app.links.at(-1)!).searchParams.get("token")!;
+}
+
+Deno.test("A1 server code confirming through auth.api: the forwarded headers are checked and a block refuses", async () => {
+  const opts = { apiKey: "sb_live_test", baseUrl: "https://sb.test", ipHeader: "x-real-ip" };
+  for (const secondLook of [false, true]) {
+    const app = makeAuth({ ...opts, secondLook }, {
+      beforeEmailVerification: signupBouncerConfirm({ ...opts, via: "button" }),
+    });
+    const m = mockApi(() => json(confirmBody("block")));
+    try {
+      const token = await signUpForToken(app, "farm@example.com");
+      let status: number | undefined;
+      try {
+        await app.auth.api.verifyEmail({
+          query: { token },
+          headers: new Headers({ "user-agent": UA, "x-real-ip": "198.51.100.4" }),
+        });
+      } catch (e) {
+        status = (e as { statusCode?: number }).statusCode;
+      }
+      assertEquals(status, 403, `secondLook: ${secondLook}`);
+      assertEquals(verified(app.db, "farm@example.com"), false);
+      assertEquals(m.confirms().map((c) => c.body), [
+        { via: "button", email: "farm@example.com", ip: "198.51.100.4", user_agent: UA },
+      ]);
+    } finally {
+      m.restore();
+    }
+  }
+});
+
+Deno.test("A1 server code confirming an email OTP through auth.api is checked too", async () => {
+  const app = makeOtpAuth(signupBouncerConfirm({ ...CODE_OPTS, via: "code" }));
+  const m = mockApi(() => json(confirmBody("block")));
+  const email = "farm@example.com";
+  try {
+    await app.signUp(email);
+    await app.post("/email-otp/send-verification-otp", { email, type: "email-verification" });
+    let status: number | undefined;
+    try {
+      await app.auth.api.verifyEmailOTP({
+        body: { email, otp: app.otps["email-verification"] },
+        headers: new Headers({ "user-agent": UA }),
+      });
+    } catch (e) {
+      status = (e as { statusCode?: number }).statusCode;
+    }
+    assertEquals(status, 403);
+    assertEquals(verified(app.db, email), false);
+    assertEquals(m.confirms().map((c) => [c.body.via, c.body.user_agent]), [["code", UA]]);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("A2 two email OTP sign-ins at once: the second cannot get a session after the first is refused", async () => {
+  const app = makeOtpAuth(signupBouncerConfirm({ ...CODE_OPTS, via: "code" }), { adapter: realisticAdapter() });
+  let release = () => {};
+  const firstHeld = new Promise<void>((r) => (release = r));
+  let calls = 0;
+  const m = mockApi(async () => {
+    // The first confirmation is still being checked while the second sign-in arrives.
+    if (calls++ === 0) await firstHeld;
+    return json(confirmBody("block"));
+  });
+  const email = "farm@example.com";
+  try {
+    await app.signUp(email);
+    await app.post("/email-otp/send-verification-otp", { email, type: "sign-in" });
+    const first = app.post("/sign-in/email-otp", { email, otp: app.otps["sign-in"] });
+    for (let i = 0; i < 100 && m.confirms().length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    assertEquals(m.confirms().length, 1);
+    await app.post("/email-otp/send-verification-otp", { email, type: "sign-in" });
+    const second = app.post("/sign-in/email-otp", { email, otp: app.otps["sign-in"] });
+    await new Promise((r) => setTimeout(r, 100)); // the second is now waiting for the first one's clean-up lock
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assertEquals([a.status, b.status], [403, 403]);
+    assertEquals(b.cookies.includes("session_token"), false);
+    assertEquals(app.db.session.length, 0);
+    assertEquals(verified(app.db, email), false);
+  } finally {
+    release();
+    m.restore();
+  }
+});
+
+Deno.test("A3 a stalled user lookup cannot hold a verified link click past CONFIRM_TIMEOUT_MS", async () => {
+  const control = { stallUsers: false };
+  const db = { user: [], session: [], account: [], verification: [] } as Db;
+  const links: string[] = [];
+  const auth = betterAuth({
+    baseURL: BASE,
+    secret: SECRET,
+    database: realisticAdapter(control)(db),
+    emailAndPassword: { enabled: true, requireEmailVerification: true },
+    emailVerification: {
+      sendOnSignUp: true,
+      sendVerificationEmail: ({ url }) => void links.push(url) as unknown as Promise<void>,
+    },
+    // Once the address is verified, every later user lookup stalls: only the plugin's own lookup is left.
+    databaseHooks: { user: { update: { after: () => Promise.resolve(void (control.stallUsers = true)) } } },
+    rateLimit: { enabled: false },
+    telemetry: { enabled: false },
+    plugins: [
+      signupBouncer({ apiKey: "sb_live_test", baseUrl: "https://sb.test", ipHeader: "x-real-ip", secondLook: true }),
+    ],
+  });
+  const m = mockApi(() => json(confirmBody("allow")));
+  try {
+    const signedUp = await auth.handler(
+      new Request(`${BASE}/api/auth/sign-up/email`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: BASE },
+        body: JSON.stringify({ email: "slow@example.com", password: "correct-horse-battery", name: "Test" }),
+      }),
+    );
+    await signedUp.body?.cancel();
+    for (let i = 0; i < 50 && links.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    const started = performance.now();
+    const res = await auth.handler(new Request(links.at(-1)!, { headers: { "user-agent": UA } }));
+    await res.body?.cancel();
+    const took = performance.now() - started;
+    assert(res.status === 302 || res.status === 200, `status ${res.status}`);
+    assert(took < CONFIRM_TIMEOUT_MS + 500, `took ${took} ms`);
+    assertEquals(db.user[0]?.emailVerified, true);
+    assertEquals(m.confirms().length, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+Deno.test("A4 one app's signupBouncerConfirm never hides another app's secondLook report", async () => {
+  const a = makeAuth({ apiKey: "sb_live_a" }, {
+    beforeEmailVerification: signupBouncerConfirm({ apiKey: "sb_live_a", baseUrl: "https://sb.test", via: "button" }),
+  });
+  const b = makeAuth({ apiKey: "sb_live_b", secondLook: true });
+  const m = mockApi(() => json(confirmBody("allow")));
+  try {
+    await signUpAndConfirm(a, "same@example.com");
+    await signUpAndConfirm(b, "same@example.com");
+    assertEquals(m.confirms().map((c) => [c.headers.get("authorization"), c.body.via]), [
+      ["Bearer sb_live_a", "button"],
+      ["Bearer sb_live_b", "link"],
+    ]);
+  } finally {
+    m.restore();
   }
 });
 
