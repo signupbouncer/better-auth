@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0
 
 The plugin can now tell SignupBouncer when a user clicks the link in Better Auth's verification email, so a challenged
 sign-up gets SignupBouncer's second look at email confirmation. It only records: it never refuses a confirmation, and it
